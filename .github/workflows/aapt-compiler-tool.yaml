@@ -41,33 +41,43 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Set up Android SDK & AAPT2
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Build-Tools & Platform
+      - name: Set up Android SDK Environment
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
+          echo "$SDK_DIR/platform-tools" >> $GITHUB_PATH
+          BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$BUILD_TOOLS_DIR" ]; then
+            echo "$BUILD_TOOLS_DIR" >> $GITHUB_PATH
+          fi
+          echo "Android SDK located at: $SDK_DIR"
 
       - name: Compile and Link Resources using AAPT2
         run: |
           echo "==> Step 1: Locating AAPT2 and Android platform JAR..."
-          BUILD_TOOLS_DIR=$(find $ANDROID_SDK_ROOT/build-tools -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
           AAPT2="$BUILD_TOOLS_DIR/aapt2"
-          ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/android-35/android.jar"
+          ANDROID_JAR=$(find "$SDK_DIR/platforms" -name "android.jar" 2>/dev/null | sort -V | tail -n 1)
           echo "Using AAPT2 from: $AAPT2"
           echo "Using Android JAR: $ANDROID_JAR"
 
           mkdir -p output/compiled_res output/aapt_out
 
           chmod +x ./gradlew 2>/dev/null || true
+          if [ ! -f "./gradlew" ] && command -v gradle &>/dev/null; then
+            gradle wrapper
+          fi
+          chmod +x ./gradlew 2>/dev/null || true
+
           if [ -f "./gradlew" ]; then
             echo "Running Gradle resource compilation tasks..."
-            ./gradlew :app:processDebugResources :app:packageDebugResources --no-daemon 2>/dev/null || true
+            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon 2>/dev/null || true
           fi
 
           echo "Searching for compiled resources.arsc in build directories..."
-          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" | head -n 1)
+          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" 2>/dev/null | head -n 1)
           if [ -n "$ARSC_FOUND" ] && [ -f "$ARSC_FOUND" ]; then
             cp "$ARSC_FOUND" output/aapt_out/resources.arsc
             echo "Found and copied resources.arsc: $ARSC_FOUND"
@@ -86,10 +96,11 @@ jobs:
           done
 
           echo "Linking compiled resources, AndroidManifest.xml, and web assets..."
-          MANIFEST="app/src/main/AndroidManifest.xml"
+          sed 's/<manifest /<manifest package="com.abd.webapp.android.google.gemini.interface" /' app/src/main/AndroidManifest.xml > output/AndroidManifest.xml
+          MANIFEST="output/AndroidManifest.xml"
           FLAT_FILES=$(find output/flat_res -name "*.flat" 2>/dev/null)
           
-          if [ -n "$FLAT_FILES" ]; then
+          if [ -n "$FLAT_FILES" ] && [ -f "$ANDROID_JAR" ] && [ -x "$AAPT2" ]; then
             "$AAPT2" link \
               -I "$ANDROID_JAR" \
               --manifest "$MANIFEST" \
@@ -101,6 +112,15 @@ jobs:
 
           if [ -f "output/aapt_out/resources.apk" ]; then
             unzip -q -o output/aapt_out/resources.apk resources.arsc AndroidManifest.xml -d output/aapt_out/ 2>/dev/null || true
+          fi
+
+          if [ ! -f "output/aapt_out/AndroidManifest.xml" ]; then
+            MANIFEST_GEN=$(find app/build -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
+            if [ -n "$MANIFEST_GEN" ]; then
+              cp "$MANIFEST_GEN" output/aapt_out/AndroidManifest.xml
+            else
+              cp "$MANIFEST" output/aapt_out/AndroidManifest.xml
+            fi
           fi
 
           mkdir -p output/aapt_out/assets
