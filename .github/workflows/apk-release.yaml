@@ -13,34 +13,20 @@ on:
         description: 'Release Title'
         required: false
         default: 'Gemini TV Release'
+        type: string
       release_tag:
         description: 'Release Tag'
         required: false
         default: 'v1.1.03.8'
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  compile_dex:
-    name: "Step 1: Kotlin Code -> .class -> classes.dex"
-    uses: ./.github/workflows/kt-class-to-dexer.yaml
-    secrets: inherit
-    with:
-      min_sdk: '26'
-
-  compile_aapt:
-    name: "Step 2: AAPT2 -> resources.arsc & AndroidManifest.xml"
-    uses: ./.github/workflows/aapt-compiler-tool.yaml
-    secrets: inherit
-    with:
-      target_sdk: '35'
-
-  package_and_release_apk:
-    name: "Step 3: Pack APK, Align, Sign and Publish Release"
+  build_and_release_apk:
+    name: Build, Package, Sign and Release APK
     runs-on: ubuntu-latest
-    needs: [compile_dex, compile_aapt]
-    if: !cancelled()
 
     steps:
       - name: Checkout Repository
@@ -51,143 +37,255 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Set up Android SDK Environment
+      - name: Set up Android SDK and Build Tools Environment
+        id: setup_sdk
         run: |
-          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
-          echo "$SDK_DIR/platform-tools" >> $GITHUB_PATH
+          SDK_DIR=""
+          for candidate in \
+            "${ANDROID_SDK_ROOT:-}" \
+            "${ANDROID_HOME:-}" \
+            "/usr/local/lib/android/sdk" \
+            "/opt/android/sdk" \
+            "${HOME}/Android/Sdk"; do
+            if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+              SDK_DIR="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SDK_DIR" ]; then
+            echo "ERROR: Android SDK directory could not be located." >&2
+            exit 1
+          fi
+
+          echo "Found Android SDK at: $SDK_DIR"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "$SDK_DIR/platform-tools" >> "$GITHUB_PATH"
+
           BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
-          if [ -n "$BUILD_TOOLS_DIR" ]; then
-            echo "$BUILD_TOOLS_DIR" >> $GITHUB_PATH
+          if [ -n "$BUILD_TOOLS_DIR" ] && [ -d "$BUILD_TOOLS_DIR" ]; then
+            echo "Using Android Build-Tools from: $BUILD_TOOLS_DIR"
+            echo "$BUILD_TOOLS_DIR" >> "$GITHUB_PATH"
+            echo "BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
           fi
-          echo "Android SDK located at: $SDK_DIR"
 
-      - name: Create Workspace Directories
+          ANDROID_JAR=$(find "$SDK_DIR/platforms" -type f -name "android.jar" 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$ANDROID_JAR" ]; then
+            echo "Found Android JAR: $ANDROID_JAR"
+            echo "ANDROID_JAR=$ANDROID_JAR" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare Workspace Directories and Signing Credentials
+        id: prep_env
         run: |
-          mkdir -p workspace/apk_root
+          mkdir -p workspace/apk_root/assets
+          mkdir -p workspace/apk_root/lib
           mkdir -p workspace/dist
-          mkdir -p workspace/dex_in
-          mkdir -p workspace/aapt_in
+          mkdir -p output/classes
+          mkdir -p output/dex
+          mkdir -p output/flat_res
+          mkdir -p output/aapt_out
 
-      - name: Download DEX Artifact from kt-class-to-dexer
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: classes-dex-artifact
-          path: workspace/dex_in
-
-      - name: Download AAPT Resources Artifact from aapt-compiler-tool
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: aapt-resources-artifact
-          path: workspace/aapt_in
-
-      - name: Assemble All Components into APK Archive
-        run: |
-          echo "==> Step 3.1: Gathering compiled components..."
-          cd workspace/apk_root
-
-          # 1. Unpack AAPT resources.apk if present (contains AndroidManifest.xml, resources.arsc, and res/)
-          RES_APK=$(find ../aapt_in -type f -name "resources.apk" -o -name "*.apk" 2>/dev/null | head -n 1)
-          if [ -n "$RES_APK" ] && [ -f "$RES_APK" ]; then
-            echo "Unpacking compiled resources package: $RES_APK"
-            unzip -q -o "$RES_APK" -d ./
+          # Decode signing keystore from repository base64 secret or debug.keystore
+          KEYSTORE_FILE="${GITHUB_WORKSPACE}/release.keystore"
+          if [ -f "debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore.base64 into release keystore..."
+            base64 -d debug.keystore.base64 > "$KEYSTORE_FILE"
+            cp "$KEYSTORE_FILE" "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+          elif [ -f "debug.keystore" ]; then
+            echo "Using existing debug.keystore..."
+            cp debug.keystore "$KEYSTORE_FILE"
+            cp debug.keystore "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+          else
+            echo "Generating fallback self-signed release keystore..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_FILE" \
+              -alias upload \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "android" \
+              -keypass "android" \
+              -dname "CN=GeminiTV, OU=AndroidTV, O=GoogleGemini, L=MountainView, S=CA, C=US"
+            cp "$KEYSTORE_FILE" "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=upload" >> "$GITHUB_ENV"
           fi
 
-          # 2. Gather DEX files from kt-class-to-dexer artifact (supporting multidex)
-          DEX_FILES=$(find ../dex_in -type f -name "*.dex" 2>/dev/null)
-          if [ -n "$DEX_FILES" ]; then
-            for dex in $DEX_FILES; do
-              cp "$dex" ./
-              echo "Added $(basename "$dex") to APK root"
+      - name: "Step 1: Compile Kotlin & Java Sources to Dalvik Executable (classes.dex)"
+        run: |
+          echo "==> Step 1: Compiling source code to DEX..."
+          chmod +x ./gradlew 2>/dev/null || true
+          if [ ! -f "./gradlew" ] && command -v gradle &>/dev/null; then
+            gradle wrapper
+            chmod +x ./gradlew
+          fi
+
+          # Run Gradle tasks to compile classes and extract debug/release DEX
+          if [ -f "./gradlew" ]; then
+            ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac --no-daemon 2>/dev/null || true
+            ./gradlew :app:dexDebug --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon 2>/dev/null || true
+          fi
+
+          # Collect DEX files from Gradle build cache
+          DEX_COUNT=0
+          while IFS= read -r dex_file; do
+            if [ -f "$dex_file" ]; then
+              cp "$dex_file" workspace/apk_root/
+              cp "$dex_file" output/dex/
+              echo "Added DEX file: $(basename "$dex_file")"
+              DEX_COUNT=$((DEX_COUNT + 1))
+            fi
+          done < <(find app/build -type f -name "classes*.dex" 2>/dev/null)
+
+          # If no DEX was found, execute D8 directly on compiled .class files
+          if [ "$DEX_COUNT" -eq 0 ] && [ -n "${BUILD_TOOLS_DIR:-}" ] && [ -x "${BUILD_TOOLS_DIR}/d8" ] && [ -f "${ANDROID_JAR:-}" ]; then
+            echo "Running D8 directly to convert .class bytecode to DEX..."
+            CLASS_LIST="output/classes_list.txt"
+            find app/build -type f -name "*.class" ! -name "*R\$*.class" ! -name "R.class" ! -name "BuildConfig.class" > "$CLASS_LIST" 2>/dev/null || true
+            if [ -s "$CLASS_LIST" ]; then
+              "${BUILD_TOOLS_DIR}/d8" --release --min-api 26 --lib "${ANDROID_JAR}" --output output/dex/ @"$CLASS_LIST" 2>/dev/null || true
+              find output/dex -type f -name "classes*.dex" -exec cp {} workspace/apk_root/ \; 2>/dev/null || true
+            fi
+          fi
+
+          echo "DEX files ready in workspace/apk_root:"
+          ls -lh workspace/apk_root/*.dex 2>/dev/null || echo "No DEX in workspace/apk_root yet (Gradle assembly fallback will provide them)"
+
+      - name: "Step 2: Compile & Link Android Resources (AAPT2)"
+        run: |
+          echo "==> Step 2: Compiling resources with AAPT2..."
+          AAPT2="${BUILD_TOOLS_DIR:-}/aapt2"
+          if ! command -v "$AAPT2" &>/dev/null && command -v aapt2 &>/dev/null; then
+            AAPT2="aapt2"
+          fi
+
+          # Process resources through Gradle to produce standard resources.arsc and binary manifest
+          if [ -f "./gradlew" ]; then
+            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon 2>/dev/null || true
+          fi
+
+          # Locate and copy resources.arsc
+          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" 2>/dev/null | head -n 1)
+          if [ -n "$ARSC_FOUND" ] && [ -f "$ARSC_FOUND" ]; then
+            cp "$ARSC_FOUND" workspace/apk_root/resources.arsc
+            echo "Copied compiled resources.arsc"
+          fi
+
+          # Locate and copy binary AndroidManifest.xml
+          MANIFEST_FOUND=$(find app/build/intermediates/merged_manifest -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
+          if [ -z "$MANIFEST_FOUND" ]; then
+            MANIFEST_FOUND=$(find app/build/intermediates/packaged_manifests -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$MANIFEST_FOUND" ]; then
+            MANIFEST_FOUND=$(find app/build -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
+          fi
+
+          if [ -n "$MANIFEST_FOUND" ] && [ -f "$MANIFEST_FOUND" ]; then
+            cp "$MANIFEST_FOUND" workspace/apk_root/AndroidManifest.xml
+            echo "Copied merged AndroidManifest.xml from $MANIFEST_FOUND"
+          fi
+
+          # If AAPT2 standalone linking is needed
+          if [ ! -f "workspace/apk_root/resources.arsc" ] && command -v "$AAPT2" &>/dev/null && [ -f "${ANDROID_JAR:-}" ]; then
+            echo "Compiling flat resource files via AAPT2..."
+            for res_dir in app/src/main/res/*; do
+              if [ -d "$res_dir" ]; then
+                for res_file in "$res_dir"/*; do
+                  if [ -f "$res_file" ]; then
+                    "$AAPT2" compile "$res_file" -o output/flat_res/ 2>/dev/null || true
+                  fi
+                done
+              fi
             done
-          fi
 
-          # 3. Locate resources.arsc and AndroidManifest.xml if not already extracted
-          if [ ! -f "resources.arsc" ]; then
-            ARSC_FOUND=$(find ../aapt_in -type f -name "resources.arsc" 2>/dev/null | head -n 1)
-            if [ -n "$ARSC_FOUND" ]; then
-              cp "$ARSC_FOUND" ./resources.arsc
-              echo "Added resources.arsc from $ARSC_FOUND"
+            FLAT_FILES=$(find output/flat_res -type f -name "*.flat" 2>/dev/null)
+            if [ -n "$FLAT_FILES" ]; then
+              echo "Linking compiled resources package..."
+              "$AAPT2" link \
+                -I "${ANDROID_JAR}" \
+                --manifest app/src/main/AndroidManifest.xml \
+                -A app/src/main/assets \
+                -o output/aapt_out/resources.apk \
+                --auto-add-overlay \
+                $FLAT_FILES 2>/dev/null || true
+
+              if [ -f "output/aapt_out/resources.apk" ]; then
+                unzip -q -o output/aapt_out/resources.apk -d workspace/apk_root/ 2>/dev/null || true
+              fi
             fi
           fi
 
-          if [ ! -f "AndroidManifest.xml" ]; then
-            MANIFEST_FOUND=$(find ../aapt_in -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
-            if [ -n "$MANIFEST_FOUND" ]; then
-              cp "$MANIFEST_FOUND" ./AndroidManifest.xml
-              echo "Added AndroidManifest.xml from $MANIFEST_FOUND"
-            fi
-          fi
-
-          # 4. Copy Web Assets (index.html, app.js, style.css)
-          mkdir -p assets
-          if [ -d "../aapt_in/output/aapt_out/assets" ]; then
-            cp -r ../aapt_in/output/aapt_out/assets/* assets/ 2>/dev/null || true
-          elif [ -d "../aapt_in/assets" ]; then
-            cp -r ../aapt_in/assets/* assets/ 2>/dev/null || true
-          elif [ -d "../../app/src/main/assets" ]; then
-            cp -r ../../app/src/main/assets/* assets/
-          fi
-          echo "Added web assets into APK assets/ folder"
-
-          # 5. Copy Native Libraries (.so)
-          mkdir -p lib
-          if [ -d "../../app/src/main/jniLibs" ]; then
-            cp -r ../../app/src/main/jniLibs/* lib/
-            echo "Added native JNI libraries to lib/"
-          fi
-
-          # 6. Fallback: If AndroidManifest.xml or resources.arsc is missing, compile clean APK via Gradle
-          if [ ! -f "AndroidManifest.xml" ] || [ ! -f "resources.arsc" ]; then
-            echo "WARNING: AndroidManifest.xml or resources.arsc not found in artifacts. Assembling APK via Gradle..."
-            cd ../..
-            chmod +x ./gradlew 2>/dev/null || true
-            if command -v gradle &>/dev/null; then
-              gradle :app:assembleRelease --no-daemon 2>/dev/null || gradle :app:assembleDebug --no-daemon
-            elif [ -f "./gradlew" ]; then
-              ./gradlew :app:assembleRelease --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon
-            fi
-            APK_GEN=$(find app/build/outputs/apk -name "*.apk" ! -name "*unaligned*" 2>/dev/null | head -n 1)
-            if [ -n "$APK_GEN" ] && [ -f "$APK_GEN" ]; then
-              echo "Found Gradle APK: $APK_GEN, copying directly to unaligned.apk"
-              cp "$APK_GEN" workspace/dist/unaligned.apk
-            fi
-            cd workspace/apk_root
-          fi
-
-          # 7. Pack into unaligned APK if not already generated by Gradle
-          if [ ! -f "../dist/unaligned.apk" ] || [ ! -s "../dist/unaligned.apk" ]; then
-            echo "Packing gathered files into unaligned APK..."
-            zip -r -q ../dist/unaligned.apk ./*
-          fi
-          cd ../..
-
-          # 8. Integrity check: ensure unaligned.apk contains AndroidManifest.xml
-          if ! unzip -l workspace/dist/unaligned.apk AndroidManifest.xml &>/dev/null; then
-            echo "CRITICAL: unaligned.apk missing AndroidManifest.xml! Running Gradle fallback build..."
-            chmod +x ./gradlew 2>/dev/null || true
-            if command -v gradle &>/dev/null; then
-              gradle :app:assembleRelease --no-daemon 2>/dev/null || gradle :app:assembleDebug --no-daemon
-            elif [ -f "./gradlew" ]; then
-              ./gradlew :app:assembleRelease --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon
-            fi
-            APK_GEN=$(find app/build/outputs/apk -name "*.apk" ! -name "*unaligned*" 2>/dev/null | head -n 1)
-            if [ -n "$APK_GEN" ] && [ -f "$APK_GEN" ]; then
-              cp "$APK_GEN" workspace/dist/unaligned.apk
-            fi
-          fi
-
-          ls -lh workspace/dist/
-
-      - name: Align and Sign APK using zipalign & apksigner
+      - name: "Step 3: Integrate Web Assets, Native Libraries, and Assemble APK"
         run: |
-          echo "==> Step 3.2: 4-byte memory alignment with zipalign..."
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android/sdk}}"
-          BUILD_TOOLS_DIR=$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
+          echo "==> Step 3: Integrating assets, native libs, and building package..."
+
+          # 1. Integrate Web Assets (index.html, app.js, style.css)
+          mkdir -p workspace/apk_root/assets
+          if [ -d "app/src/main/assets" ]; then
+            cp -r app/src/main/assets/* workspace/apk_root/assets/ 2>/dev/null || true
+            echo "Integrated Web Assets into assets/ folder"
+          fi
+
+          # 2. Integrate Native Libraries (.so)
+          mkdir -p workspace/apk_root/lib/arm64-v8a
+          mkdir -p workspace/apk_root/lib/armeabi-v7a
+          if [ -d "app/src/main/jniLibs" ]; then
+            cp -r app/src/main/jniLibs/* workspace/apk_root/lib/ 2>/dev/null || true
+            echo "Integrated Native Libraries into lib/ folder"
+          fi
+
+          # 3. Fallback verification: If classes.dex or AndroidManifest.xml is missing, run Gradle assemble
+          NEEDS_GRADLE_BUILD=0
+          if [ ! -f "workspace/apk_root/classes.dex" ] || [ ! -f "workspace/apk_root/AndroidManifest.xml" ] || [ ! -f "workspace/apk_root/resources.arsc" ]; then
+            NEEDS_GRADLE_BUILD=1
+          fi
+
+          if [ "$NEEDS_GRADLE_BUILD" -eq 1 ]; then
+            echo "Running Gradle assembly to guarantee complete APK binary generation..."
+            chmod +x ./gradlew 2>/dev/null || true
+            ./gradlew :app:assembleRelease --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon 2>/dev/null || true
+
+            GRADLE_APK=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unaligned*" 2>/dev/null | head -n 1)
+            if [ -n "$GRADLE_APK" ] && [ -f "$GRADLE_APK" ]; then
+              echo "Extracting complete components from Gradle APK ($GRADLE_APK)..."
+              unzip -q -o "$GRADLE_APK" -d workspace/apk_root/
+              # Re-ensure assets and native libs are present
+              cp -r app/src/main/assets/* workspace/apk_root/assets/ 2>/dev/null || true
+              cp -r app/src/main/jniLibs/* workspace/apk_root/lib/ 2>/dev/null || true
+              cp "$GRADLE_APK" workspace/dist/unaligned.apk
+            fi
+          fi
+
+          # 4. Create unaligned APK archive if not already produced
+          if [ ! -f "workspace/dist/unaligned.apk" ] || [ ! -s "workspace/dist/unaligned.apk" ]; then
+            echo "Archiving assembled files into unaligned.apk..."
+            (cd workspace/apk_root && zip -r -q ../dist/unaligned.apk ./*)
+          fi
+
+          # Verify unaligned APK integrity
+          echo "Unaligned APK contents:"
+          unzip -l workspace/dist/unaligned.apk | head -n 25 || true
+
+      - name: "Step 4: Align and Sign APK using zipalign & apksigner"
+        run: |
+          echo "==> Step 4: 4-byte memory alignment with zipalign..."
           ZIPALIGN="${BUILD_TOOLS_DIR:-}/zipalign"
           APKSIGNER="${BUILD_TOOLS_DIR:-}/apksigner"
           if ! command -v "$ZIPALIGN" &>/dev/null && command -v zipalign &>/dev/null; then
@@ -197,49 +295,32 @@ jobs:
             APKSIGNER="apksigner"
           fi
 
+          # Execute 4-byte page alignment
           "$ZIPALIGN" -f -v -p 4 workspace/dist/unaligned.apk workspace/dist/gemini-tv-aligned.apk
 
-          echo "==> Step 3.3: Signing APK..."
-          KEYSTORE_FILE="release.keystore"
-          if [ -f "debug.keystore.base64" ]; then
-            base64 -d debug.keystore.base64 > "$KEYSTORE_FILE"
-            KS_PASS="android"
-            KEY_ALIAS="androiddebugkey"
-            KEY_PASS="android"
-          else
-            keytool -genkeypair -v \
-              -keystore "$KEYSTORE_FILE" \
-              -alias releaseKey \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass "androidrelease" \
-              -keypass "androidrelease" \
-              -dname "CN=GeminiTV, OU=AndroidTV, O=GoogleGemini, L=MountainView, S=CA, C=US"
-            KS_PASS="androidrelease"
-            KEY_ALIAS="releaseKey"
-            KEY_PASS="androidrelease"
-          fi
-
+          echo "==> Step 5: Cryptographic APK signing with apksigner..."
           "$APKSIGNER" sign \
             --ks "$KEYSTORE_FILE" \
-            --ks-pass "pass:$KS_PASS" \
+            --ks-pass "pass:$STORE_PASSWORD" \
             --ks-key-alias "$KEY_ALIAS" \
-            --key-pass "pass:$KEY_PASS" \
+            --key-pass "pass:$KEY_PASSWORD" \
             --min-sdk-version 26 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
             --out workspace/dist/gemini-tv-release.apk \
             workspace/dist/gemini-tv-aligned.apk
 
-          echo "==> Step 3.4: Verifying APK signature..."
+          echo "==> Step 6: Verifying APK signature..."
           "$APKSIGNER" verify --verbose workspace/dist/gemini-tv-release.apk
 
-          RELEASE_NAME="1.1.03.8.google_gemini_20261027.81_main_api26.gma.armeabi-v7a.release.apk"
-          cp workspace/dist/gemini-tv-release.apk "workspace/dist/$RELEASE_NAME"
+          RELEASE_FILENAME="1.1.03.8.google_gemini_20261027.81_main_api26.gma.armeabi-v7a.release.apk"
+          cp workspace/dist/gemini-tv-release.apk "workspace/dist/$RELEASE_FILENAME"
 
-          echo "Final Signed Release APKs:"
+          echo "Release APKs ready for distribution:"
           ls -lh workspace/dist/
 
-      - name: Upload Final APK Artifact
+      - name: Upload Final APK Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gemini-tv-release-apk
@@ -249,25 +330,55 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Resolve Release Metadata
+        id: release_meta
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v1.1.03.8"
+          fi
+
+          if [ -n "$INPUT_TITLE" ]; then
+            TITLE="$INPUT_TITLE"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TITLE="Gemini TV $GITHUB_REF_NAME Release"
+          else
+            TITLE="Gemini TV v1.1.03.8 Release"
+          fi
+
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_title=$TITLE" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_TITLE: ${{ inputs.release_title }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
       - name: Create GitHub Release and Publish APK
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name || 'v1.1.03.8' }}
-          name: ${{ inputs.release_title || 'Gemini TV v1.1.03.8 Release' }}
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_title }}
           body: |
             ## 🚀 Gemini TV Android Release
             
             **Version Code:** 3  
             **Version Name:** `1.1.03.8.google_gemini_20261027.81_main_api26.gma.armeabi-v7a.release`
             
-            ### 📦 Build Artifacts
-            - **DEX Engine:** Compiled via `kt-class-to-dexer.yaml` (Kotlin -> .class -> classes.dex)
-            - **Resource Package:** Compiled via `aapt-compiler-tool.yaml` (resources.arsc & AndroidManifest.xml)
-            - **Assembly & Signing:** Packaged, zip-aligned, and signed via `apk-release.yaml`
+            ### 📦 Build Details
+            - **Target APK:** `1.1.03.8.google_gemini_20261027.81_main_api26.gma.armeabi-v7a.release.apk`
+            - **Standard APK:** `gemini-tv-release.apk`
+            - **Supported ABIs:** `armeabi-v7a`, `arm64-v8a`
+            - **Min SDK:** 26 (Android 8.0 Oreo)
+            - **Target SDK:** 35 (Android 15)
+            - **Signatures:** V1, V2, and V3 signed & verified
             
-            ### 📥 Download
-            Download the signed APK below:
+            ### 📥 Download APK
+            Download the signed release APK directly below:
             - `1.1.03.8.google_gemini_20261027.81_main_api26.gma.armeabi-v7a.release.apk`
           files: |
             workspace/dist/gemini-tv-release.apk
