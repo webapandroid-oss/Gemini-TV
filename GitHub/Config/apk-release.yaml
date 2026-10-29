@@ -22,9 +22,6 @@ permissions:
   contents: write
 
 jobs:
-  # --------------------------------------------------------------------------
-  # Action 2: Kotlin to Class to Dalvik DEX Compiler
-  # --------------------------------------------------------------------------
   compile_dex:
     name: "Step 1: Kotlin Code -> .class -> classes.dex"
     uses: ./.github/workflows/kt-class-to-dexer.yaml
@@ -32,9 +29,6 @@ jobs:
     with:
       min_sdk: '26'
 
-  # --------------------------------------------------------------------------
-  # Action 3: AAPT2 Resource & Manifest Compiler
-  # --------------------------------------------------------------------------
   compile_aapt:
     name: "Step 2: AAPT2 -> resources.arsc & AndroidManifest.xml"
     uses: ./.github/workflows/aapt-compiler-tool.yaml
@@ -42,13 +36,11 @@ jobs:
     with:
       target_sdk: '35'
 
-  # --------------------------------------------------------------------------
-  # Action 1: Package DEX + ARSC + Manifest into APK, Sign & Release
-  # --------------------------------------------------------------------------
   package_and_release_apk:
     name: "Step 3: Pack APK, Align, Sign and Publish Release"
     runs-on: ubuntu-latest
     needs: [compile_dex, compile_aapt]
+    if: !cancelled()
 
     steps:
       - name: Checkout Repository
@@ -60,27 +52,35 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android Build Tools & SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Build-Tools
+      - name: Set up Android SDK Environment
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
+          echo "$SDK_DIR/platform-tools" >> $GITHUB_PATH
+          BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$BUILD_TOOLS_DIR" ]; then
+            echo "$BUILD_TOOLS_DIR" >> $GITHUB_PATH
+          fi
+          echo "Android SDK located at: $SDK_DIR"
 
       - name: Create Workspace Directories
         run: |
           mkdir -p workspace/apk_root
           mkdir -p workspace/dist
+          mkdir -p workspace/dex_in
+          mkdir -p workspace/aapt_in
 
       - name: Download DEX Artifact from kt-class-to-dexer
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: classes-dex-artifact
           path: workspace/dex_in
 
       - name: Download AAPT Resources Artifact from aapt-compiler-tool
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: aapt-resources-artifact
           path: workspace/aapt_in
@@ -197,11 +197,9 @@ jobs:
             APKSIGNER="apksigner"
           fi
 
-          # Zipalign 4-byte page boundary (with -f to force overwrite)
           "$ZIPALIGN" -f -v -p 4 workspace/dist/unaligned.apk workspace/dist/gemini-tv-aligned.apk
 
           echo "==> Step 3.3: Signing APK..."
-          # Check for debug.keystore or generate a secure keystore for the release
           KEYSTORE_FILE="release.keystore"
           if [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > "$KEYSTORE_FILE"
