@@ -1,0 +1,127 @@
+name: AAPT Resource Compiler Tool
+
+on:
+  workflow_call:
+    inputs:
+      target_sdk:
+        description: 'Target SDK for linking resources'
+        required: false
+        default: '35'
+        type: string
+    outputs:
+      aapt_artifact_name:
+        description: 'Name of the compiled AAPT resources artifact'
+        value: ${{ jobs.compile_resources_aapt.outputs.aapt_artifact }}
+      resources_path:
+        description: 'Path to compiled resources.arsc and package'
+        value: ${{ jobs.compile_resources_aapt.outputs.resources_dir }}
+  workflow_dispatch:
+    inputs:
+      target_sdk:
+        description: 'Target SDK for linking resources'
+        required: false
+        default: '35'
+
+jobs:
+  compile_resources_aapt:
+    name: Compile Android Resources and Manifest via AAPT2
+    runs-on: ubuntu-latest
+    outputs:
+      aapt_artifact: aapt-resources-artifact
+      resources_dir: output/aapt_out
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK & AAPT2
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build-Tools & Platform
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Compile and Link Resources using AAPT2
+        run: |
+          echo "==> Step 1: Locating AAPT2 and Android platform JAR..."
+          BUILD_TOOLS_DIR=$(find $ANDROID_SDK_ROOT/build-tools -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          AAPT2="$BUILD_TOOLS_DIR/aapt2"
+          ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/android-35/android.jar"
+          echo "Using AAPT2 from: $AAPT2"
+          echo "Using Android JAR: $ANDROID_JAR"
+
+          mkdir -p output/compiled_res output/aapt_out
+
+          # Generate resource package and resources.arsc
+          chmod +x ./gradlew 2>/dev/null || true
+          if [ -f "./gradlew" ]; then
+            echo "Running Gradle resource compilation tasks..."
+            ./gradlew :app:processDebugResources :app:packageDebugResources --no-daemon 2>/dev/null || true
+          fi
+
+          # Locate generated resources.arsc and compiled AndroidManifest.xml
+          echo "Searching for compiled resources.arsc in build directories..."
+          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" | head -n 1)
+          if [ -n "$ARSC_FOUND" ] && [ -f "$ARSC_FOUND" ]; then
+            cp "$ARSC_FOUND" output/aapt_out/resources.arsc
+            echo "Found and copied resources.arsc: $ARSC_FOUND"
+          fi
+
+          # Direct AAPT2 compilation & link workflow:
+          echo "Compiling all XML & drawable assets with AAPT2 compile..."
+          mkdir -p output/flat_res
+          for dir in app/src/main/res/*; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"/*; do
+                if [ -f "$file" ]; then
+                  "$AAPT2" compile "$file" -o output/flat_res/ 2>/dev/null || true
+                fi
+              done
+            fi
+          done
+
+          echo "Linking compiled resources, AndroidManifest.xml, and web assets..."
+          MANIFEST="app/src/main/AndroidManifest.xml"
+          FLAT_FILES=$(find output/flat_res -name "*.flat" 2>/dev/null)
+          
+          if [ -n "$FLAT_FILES" ]; then
+            "$AAPT2" link \
+              -I "$ANDROID_JAR" \
+              --manifest "$MANIFEST" \
+              -A app/src/main/assets \
+              -o output/aapt_out/resources.apk \
+              --auto-add-overlay \
+              $FLAT_FILES 2>/dev/null || true
+          fi
+
+          # Extract resources.arsc and binary AndroidManifest.xml if resources.apk was linked
+          if [ -f "output/aapt_out/resources.apk" ]; then
+            unzip -q -o output/aapt_out/resources.apk resources.arsc AndroidManifest.xml -d output/aapt_out/ 2>/dev/null || true
+          fi
+
+          # Also package Web assets (app.js, index.html, style.css)
+          mkdir -p output/aapt_out/assets
+          cp -r app/src/main/assets/* output/aapt_out/assets/ 2>/dev/null || true
+
+          echo "AAPT compiled artifacts summary:"
+          ls -la output/aapt_out/
+
+      - name: Upload AAPT Resources Artifact for Main Orchestrator
+        uses: actions/upload-artifact@v4
+        with:
+          name: aapt-resources-artifact
+          path: |
+            output/aapt_out/resources.arsc
+            output/aapt_out/AndroidManifest.xml
+            output/aapt_out/resources.apk
+            output/aapt_out/assets/**
+          if-no-files-found: warn
+          retention-days: 7
