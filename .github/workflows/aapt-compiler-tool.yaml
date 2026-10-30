@@ -55,7 +55,7 @@ jobs:
 
       - name: Compile and Link Resources using AAPT2
         run: |
-          echo "==> Step 1: Locating AAPT2 and Android platform JAR..."
+          echo "==> Step 1: Locating Android Build-Tools and SDK..."
           SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
           AAPT2="$BUILD_TOOLS_DIR/aapt2"
@@ -63,7 +63,7 @@ jobs:
           echo "Using AAPT2 from: $AAPT2"
           echo "Using Android JAR: $ANDROID_JAR"
 
-          mkdir -p output/compiled_res output/aapt_out
+          mkdir -p output/aapt_out output/flat_res
 
           chmod +x ./gradlew 2>/dev/null || true
           if [ ! -f "./gradlew" ] && command -v gradle &>/dev/null; then
@@ -72,59 +72,32 @@ jobs:
           chmod +x ./gradlew 2>/dev/null || true
 
           if [ -f "./gradlew" ]; then
-            echo "Running Gradle resource compilation tasks..."
-            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon 2>/dev/null || true
+            echo "Running Gradle resource and manifest processing tasks..."
+            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon || true
           fi
 
-          echo "Searching for compiled resources.arsc in build directories..."
-          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" 2>/dev/null | head -n 1)
-          if [ -n "$ARSC_FOUND" ] && [ -f "$ARSC_FOUND" ]; then
-            cp "$ARSC_FOUND" output/aapt_out/resources.arsc
-            echo "Found and copied resources.arsc: $ARSC_FOUND"
+          # Extract compiled resources.arsc and compiled binary AndroidManifest.xml from linked resources .ap_
+          AP_FILE=$(find app/build/intermediates/linked_resources_binary_format -type f -name "*.ap_" 2>/dev/null | head -n 1)
+          if [ -z "$AP_FILE" ]; then
+            AP_FILE=$(find app/build/intermediates/processed_res -type f -name "*.ap_" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$AP_FILE" ]; then
+            # Assemble debug to guarantee linked resources exist
+            ./gradlew :app:assembleDebug --no-daemon || true
+            AP_FILE=$(find app/build/outputs/apk/debug -type f -name "*.apk" 2>/dev/null | head -n 1)
           fi
 
-          echo "Compiling all XML & drawable assets with AAPT2 compile..."
-          mkdir -p output/flat_res
-          for dir in app/src/main/res/*; do
-            if [ -d "$dir" ]; then
-              for file in "$dir"/*; do
-                if [ -f "$file" ]; then
-                  "$AAPT2" compile "$file" -o output/flat_res/ 2>/dev/null || true
-                fi
-              done
-            fi
-          done
-
-          echo "Linking compiled resources, AndroidManifest.xml, and web assets..."
-          sed 's/<manifest /<manifest package="com.abd.webapp.android.google.gemini.interface" /' app/src/main/AndroidManifest.xml > output/AndroidManifest.xml
-          MANIFEST="output/AndroidManifest.xml"
-          FLAT_FILES=$(find output/flat_res -name "*.flat" 2>/dev/null)
-          
-          if [ -n "$FLAT_FILES" ] && [ -f "$ANDROID_JAR" ] && [ -x "$AAPT2" ]; then
-            "$AAPT2" link \
-              -I "$ANDROID_JAR" \
-              --manifest "$MANIFEST" \
-              -A app/src/main/assets \
-              -o output/aapt_out/resources.apk \
-              --auto-add-overlay \
-              $FLAT_FILES 2>/dev/null || true
+          if [ -n "$AP_FILE" ] && [ -f "$AP_FILE" ]; then
+            echo "Extracting resources.arsc and binary AndroidManifest.xml from $AP_FILE..."
+            unzip -q -o "$AP_FILE" resources.arsc AndroidManifest.xml -d output/aapt_out/ 2>/dev/null || true
+            cp "$AP_FILE" output/aapt_out/resources.apk 2>/dev/null || true
           fi
 
-          if [ -f "output/aapt_out/resources.apk" ]; then
-            unzip -q -o output/aapt_out/resources.apk resources.arsc AndroidManifest.xml -d output/aapt_out/ 2>/dev/null || true
-          fi
-
-          if [ ! -f "output/aapt_out/AndroidManifest.xml" ]; then
-            MANIFEST_GEN=$(find app/build -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
-            if [ -n "$MANIFEST_GEN" ]; then
-              cp "$MANIFEST_GEN" output/aapt_out/AndroidManifest.xml
-            else
-              cp "$MANIFEST" output/aapt_out/AndroidManifest.xml
-            fi
-          fi
-
+          # Copy web assets
           mkdir -p output/aapt_out/assets
-          cp -r app/src/main/assets/* output/aapt_out/assets/ 2>/dev/null || true
+          if [ -d "app/src/main/assets" ]; then
+            cp -r app/src/main/assets/* output/aapt_out/assets/ 2>/dev/null || true
+          fi
 
           echo "AAPT compiled artifacts summary:"
           ls -la output/aapt_out/

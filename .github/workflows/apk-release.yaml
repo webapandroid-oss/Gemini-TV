@@ -91,24 +91,29 @@ jobs:
 
           # Decode signing keystore from repository base64 secret or debug.keystore
           KEYSTORE_FILE="${GITHUB_WORKSPACE}/release.keystore"
+          UPLOAD_KEY="${GITHUB_WORKSPACE}/my-upload-key.jks"
           if [ -f "debug.keystore.base64" ]; then
             echo "Decoding debug.keystore.base64 into release keystore..."
             base64 -d debug.keystore.base64 > "$KEYSTORE_FILE"
-            cp "$KEYSTORE_FILE" "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            cp "$KEYSTORE_FILE" "$UPLOAD_KEY"
+            keytool -changealias -keystore "$UPLOAD_KEY" -alias "androiddebugkey" -destalias "upload" -storepass "android" -keypass "android" 2>/dev/null || true
+            keytool -changealias -keystore "$KEYSTORE_FILE" -alias "androiddebugkey" -destalias "upload" -storepass "android" -keypass "android" 2>/dev/null || true
             echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=$UPLOAD_KEY" >> "$GITHUB_ENV"
             echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=upload" >> "$GITHUB_ENV"
           elif [ -f "debug.keystore" ]; then
             echo "Using existing debug.keystore..."
             cp debug.keystore "$KEYSTORE_FILE"
-            cp debug.keystore "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            cp debug.keystore "$UPLOAD_KEY"
+            keytool -changealias -keystore "$UPLOAD_KEY" -alias "androiddebugkey" -destalias "upload" -storepass "android" -keypass "android" 2>/dev/null || true
+            keytool -changealias -keystore "$KEYSTORE_FILE" -alias "androiddebugkey" -destalias "upload" -storepass "android" -keypass "android" 2>/dev/null || true
             echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=$UPLOAD_KEY" >> "$GITHUB_ENV"
             echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=upload" >> "$GITHUB_ENV"
           else
             echo "Generating fallback self-signed release keystore..."
             keytool -genkeypair -v \
@@ -120,9 +125,9 @@ jobs:
               -storepass "android" \
               -keypass "android" \
               -dname "CN=GeminiTV, OU=AndroidTV, O=GoogleGemini, L=MountainView, S=CA, C=US"
-            cp "$KEYSTORE_FILE" "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            cp "$KEYSTORE_FILE" "$UPLOAD_KEY"
             echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=$UPLOAD_KEY" >> "$GITHUB_ENV"
             echo "STORE_PASSWORD=android" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
             echo "KEY_ALIAS=upload" >> "$GITHUB_ENV"
@@ -178,57 +183,25 @@ jobs:
 
           # Process resources through Gradle to produce standard resources.arsc and binary manifest
           if [ -f "./gradlew" ]; then
-            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon 2>/dev/null || true
+            ./gradlew :app:processDebugResources :app:processDebugManifest --no-daemon || true
           fi
 
-          # Locate and copy resources.arsc
-          ARSC_FOUND=$(find app/build -type f -name "resources.arsc" 2>/dev/null | head -n 1)
-          if [ -n "$ARSC_FOUND" ] && [ -f "$ARSC_FOUND" ]; then
-            cp "$ARSC_FOUND" workspace/apk_root/resources.arsc
-            echo "Copied compiled resources.arsc"
+          # Locate and extract compiled binary resources.arsc and AndroidManifest.xml from linked resources .ap_
+          AP_FILE=$(find app/build/intermediates/linked_resources_binary_format -type f -name "*.ap_" 2>/dev/null | head -n 1)
+          if [ -z "$AP_FILE" ]; then
+            AP_FILE=$(find app/build/intermediates/processed_res -type f -name "*.ap_" 2>/dev/null | head -n 1)
           fi
 
-          # Locate and copy binary AndroidManifest.xml
-          MANIFEST_FOUND=$(find app/build/intermediates/merged_manifest -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
-          if [ -z "$MANIFEST_FOUND" ]; then
+          if [ -n "$AP_FILE" ] && [ -f "$AP_FILE" ]; then
+            echo "Extracting binary manifest and resources.arsc from $AP_FILE..."
+            unzip -q -o "$AP_FILE" resources.arsc AndroidManifest.xml -d workspace/apk_root/ 2>/dev/null || true
+          fi
+
+          # Fallback check for AndroidManifest.xml and resources.arsc
+          if [ ! -f "workspace/apk_root/resources.arsc" ] || [ ! -f "workspace/apk_root/AndroidManifest.xml" ]; then
             MANIFEST_FOUND=$(find app/build/intermediates/packaged_manifests -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
-          fi
-          if [ -z "$MANIFEST_FOUND" ]; then
-            MANIFEST_FOUND=$(find app/build -type f -name "AndroidManifest.xml" 2>/dev/null | head -n 1)
-          fi
-
-          if [ -n "$MANIFEST_FOUND" ] && [ -f "$MANIFEST_FOUND" ]; then
-            cp "$MANIFEST_FOUND" workspace/apk_root/AndroidManifest.xml
-            echo "Copied merged AndroidManifest.xml from $MANIFEST_FOUND"
-          fi
-
-          # If AAPT2 standalone linking is needed
-          if [ ! -f "workspace/apk_root/resources.arsc" ] && command -v "$AAPT2" &>/dev/null && [ -f "${ANDROID_JAR:-}" ]; then
-            echo "Compiling flat resource files via AAPT2..."
-            for res_dir in app/src/main/res/*; do
-              if [ -d "$res_dir" ]; then
-                for res_file in "$res_dir"/*; do
-                  if [ -f "$res_file" ]; then
-                    "$AAPT2" compile "$res_file" -o output/flat_res/ 2>/dev/null || true
-                  fi
-                done
-              fi
-            done
-
-            FLAT_FILES=$(find output/flat_res -type f -name "*.flat" 2>/dev/null)
-            if [ -n "$FLAT_FILES" ]; then
-              echo "Linking compiled resources package..."
-              "$AAPT2" link \
-                -I "${ANDROID_JAR}" \
-                --manifest app/src/main/AndroidManifest.xml \
-                -A app/src/main/assets \
-                -o output/aapt_out/resources.apk \
-                --auto-add-overlay \
-                $FLAT_FILES 2>/dev/null || true
-
-              if [ -f "output/aapt_out/resources.apk" ]; then
-                unzip -q -o output/aapt_out/resources.apk -d workspace/apk_root/ 2>/dev/null || true
-              fi
+            if [ -n "$MANIFEST_FOUND" ] && [ -f "$MANIFEST_FOUND" ]; then
+              cp "$MANIFEST_FOUND" workspace/apk_root/AndroidManifest.xml
             fi
           fi
 
@@ -251,26 +224,19 @@ jobs:
             echo "Integrated Native Libraries into lib/ folder"
           fi
 
-          # 3. Fallback verification: If classes.dex or AndroidManifest.xml is missing, run Gradle assemble
-          NEEDS_GRADLE_BUILD=0
-          if [ ! -f "workspace/apk_root/classes.dex" ] || [ ! -f "workspace/apk_root/AndroidManifest.xml" ] || [ ! -f "workspace/apk_root/resources.arsc" ]; then
-            NEEDS_GRADLE_BUILD=1
-          fi
+          # 3. Assemble release APK using Gradle
+          echo "Running Gradle assembly for release packaging..."
+          chmod +x ./gradlew 2>/dev/null || true
+          ./gradlew :app:assembleRelease --no-daemon || ./gradlew :app:assembleDebug --no-daemon || true
 
-          if [ "$NEEDS_GRADLE_BUILD" -eq 1 ]; then
-            echo "Running Gradle assembly to guarantee complete APK binary generation..."
-            chmod +x ./gradlew 2>/dev/null || true
-            ./gradlew :app:assembleRelease --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon 2>/dev/null || true
-
-            GRADLE_APK=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unaligned*" 2>/dev/null | head -n 1)
-            if [ -n "$GRADLE_APK" ] && [ -f "$GRADLE_APK" ]; then
-              echo "Extracting complete components from Gradle APK ($GRADLE_APK)..."
-              unzip -q -o "$GRADLE_APK" -d workspace/apk_root/
-              # Re-ensure assets and native libs are present
-              cp -r app/src/main/assets/* workspace/apk_root/assets/ 2>/dev/null || true
-              cp -r app/src/main/jniLibs/* workspace/apk_root/lib/ 2>/dev/null || true
-              cp "$GRADLE_APK" workspace/dist/unaligned.apk
-            fi
+          GRADLE_APK=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unaligned*" 2>/dev/null | head -n 1)
+          if [ -n "$GRADLE_APK" ] && [ -f "$GRADLE_APK" ]; then
+            echo "Extracting complete components from Gradle APK ($GRADLE_APK)..."
+            unzip -q -o "$GRADLE_APK" -d workspace/apk_root/
+            # Re-ensure assets and native libs are present
+            cp -r app/src/main/assets/* workspace/apk_root/assets/ 2>/dev/null || true
+            cp -r app/src/main/jniLibs/* workspace/apk_root/lib/ 2>/dev/null || true
+            cp "$GRADLE_APK" workspace/dist/unaligned.apk
           fi
 
           # 4. Create unaligned APK archive if not already produced

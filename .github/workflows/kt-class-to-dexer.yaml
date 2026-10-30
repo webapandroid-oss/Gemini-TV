@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       dex_artifact: classes-dex-artifact
-      dex_path: output/classes.dex
+      dex_path: output/dex/classes.dex
 
     steps:
       - name: Checkout Source Code
@@ -55,7 +55,7 @@ jobs:
 
       - name: Compile Kotlin and Java Sources to .class Bytecode
         run: |
-          echo "==> Step 1: Compiling Kotlin code into Java .class bytecode..."
+          echo "==> Step 1: Compiling Kotlin and Java sources into bytecode..."
           mkdir -p output/classes
           
           chmod +x ./gradlew 2>/dev/null || true
@@ -66,34 +66,54 @@ jobs:
 
           if [ -f "./gradlew" ]; then
             ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac --no-daemon
-            find app/build/intermediates/javac/debug -type f -name "*.class" -exec cp --parents {} output/classes/ \; 2>/dev/null || true
-            find app/build/tmp/kotlin-classes/debug -type f -name "*.class" -exec cp --parents {} output/classes/ \; 2>/dev/null || true
+            find app/build/intermediates/javac/debug/classes -type f -name "*.class" 2>/dev/null | while read -r f; do
+              rel="${f#app/build/intermediates/javac/debug/classes/}"
+              mkdir -p "output/classes/$(dirname "$rel")"
+              cp "$f" "output/classes/$rel"
+            done || true
+            find app/build/tmp/kotlin-classes/debug -type f -name "*.class" 2>/dev/null | while read -r f; do
+              rel="${f#app/build/tmp/kotlin-classes/debug/}"
+              mkdir -p "output/classes/$(dirname "$rel")"
+              cp "$f" "output/classes/$rel"
+            done || true
           fi
 
           echo "Compiled .class files generated:"
           find output/classes -type f -name "*.class" 2>/dev/null | head -n 30 || true
 
-      - name: Convert .class Bytecode to Android .dex with D8 / DX
+      - name: Convert .class Bytecode to Android .dex with D8 / Gradle
+        env:
+          MIN_SDK: ${{ inputs.min_sdk || '26' }}
         run: |
           echo "==> Step 2: Converting compiled .class files into Dalvik Executable (.dex)..."
           mkdir -p output/dex
 
           chmod +x ./gradlew 2>/dev/null || true
           if [ -f "./gradlew" ]; then
-            ./gradlew :app:dexDebug --no-daemon 2>/dev/null || ./gradlew :app:assembleDebug --no-daemon 2>/dev/null || true
+            ./gradlew :app:assembleDebug --no-daemon || true
           fi
 
-          # Capture all generated .dex files (including multidex)
-          find app/build -type f -name "classes*.dex" -exec cp {} output/dex/ \; 2>/dev/null || true
+          # Extract all generated .dex files (including multidex) from APK or build output
+          DEBUG_APK=$(find app/build/outputs/apk/debug -type f -name "*.apk" 2>/dev/null | head -n 1)
+          if [ -n "$DEBUG_APK" ] && [ -f "$DEBUG_APK" ]; then
+            echo "Extracting DEX files directly from $DEBUG_APK..."
+            unzip -q -j -o "$DEBUG_APK" "classes*.dex" -d output/dex/ 2>/dev/null || true
+          fi
 
+          # Fallback: search build directories for classes*.dex
+          if [ ! -f "output/dex/classes.dex" ]; then
+            find app/build/intermediates/dex/debug -type f -name "classes*.dex" -exec cp {} output/dex/ \; 2>/dev/null || true
+          fi
+
+          # Direct D8 fallback if no dex was generated
           if [ ! -f "output/dex/classes.dex" ]; then
             SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
             BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
             ANDROID_JAR=$(find "$SDK_DIR/platforms" -name "android.jar" 2>/dev/null | sort -V | tail -n 1)
             echo "Running D8 directly with android.jar..."
-            find output/classes app/build -type f -name "*.class" > class_list.txt
+            find output/classes -type f -name "*.class" > class_list.txt
             if [ -s class_list.txt ] && [ -n "$BUILD_TOOLS_DIR" ] && [ -f "$BUILD_TOOLS_DIR/d8" ]; then
-              "$BUILD_TOOLS_DIR/d8" --release --min-api ${{ inputs.min_sdk || '26' }} --lib "$ANDROID_JAR" --output output/dex/ $(cat class_list.txt) || true
+              "$BUILD_TOOLS_DIR/d8" --release --min-api "$MIN_SDK" --lib "$ANDROID_JAR" --output output/dex/ @class_list.txt || true
             fi
           fi
 
@@ -105,7 +125,6 @@ jobs:
         with:
           name: classes-dex-artifact
           path: |
-            output/dex/classes.dex
-            app/build/intermediates/dex/debug/**/*.dex
+            output/dex/*.dex
           if-no-files-found: warn
           retention-days: 7
