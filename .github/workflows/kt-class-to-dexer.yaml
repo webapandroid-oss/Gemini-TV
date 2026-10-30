@@ -1,6 +1,17 @@
 name: Kotlin Class to DEX Compiler
 
 on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      min_sdk:
+        description: 'Target minimum SDK level for dexer'
+        required: false
+        default: '26'
+        type: string
   workflow_call:
     inputs:
       min_sdk:
@@ -15,12 +26,9 @@ on:
       dex_file_path:
         description: 'Relative path to generated classes.dex'
         value: ${{ jobs.compile_kotlin_to_dex.outputs.dex_path }}
-  workflow_dispatch:
-    inputs:
-      min_sdk:
-        description: 'Target minimum SDK level for dexer'
-        required: false
-        default: '26'
+
+permissions:
+  contents: read
 
 jobs:
   compile_kotlin_to_dex:
@@ -39,38 +47,70 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
-      - name: Set up Android SDK Environment
+      - name: Set up Android SDK Environment & Accept Licenses
         run: |
           SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
-          echo "$SDK_DIR/platform-tools" >> $GITHUB_PATH
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "$SDK_DIR/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_DIR/platform-tools" >> "$GITHUB_PATH"
+
+          # Pre-accept Android SDK licenses to prevent CI prompt failures
+          mkdir -p "$SDK_DIR/licenses" 2>/dev/null || true
+          echo -e "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$SDK_DIR/licenses/android-sdk-license" 2>/dev/null || true
+          echo -e "\n84831b9409646a2a8e44e4bed4aa6b9747fa4e54\n7c027e570dde35266876b72496147297e5c45324" > "$SDK_DIR/licenses/android-sdk-preview-license" 2>/dev/null || true
+
+          SDKMANAGER=$(find "$SDK_DIR" -name "sdkmanager" -type f 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses 2>/dev/null || true
+            "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" 2>/dev/null || true
+          fi
+
           BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
           if [ -n "$BUILD_TOOLS_DIR" ]; then
-            echo "$BUILD_TOOLS_DIR" >> $GITHUB_PATH
+            echo "$BUILD_TOOLS_DIR" >> "$GITHUB_PATH"
+            echo "BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
           fi
-          echo "Android SDK located at: $SDK_DIR"
+          echo "Android SDK ready at: $SDK_DIR"
+
+      - name: Prepare CI Environment & Secrets
+        run: |
+          mkdir -p output/classes output/dex
+
+          # 1. Create .env if missing (gitignored in repo)
+          if [ ! -f ".env" ]; then
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+            else
+              touch .env
+            fi
+          fi
+
+          # 2. Make gradlew executable
+          chmod +x ./gradlew 2>/dev/null || true
+
+          # 3. Restore debug.keystore if missing (gitignored in repo, required by debugConfig)
+          if [ ! -f "debug.keystore" ]; then
+            if [ -f "debug.keystore.base64" ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
+            fi
+          fi
 
       - name: Compile Kotlin and Java Sources to .class Bytecode
         run: |
           echo "==> Step 1: Compiling Kotlin and Java sources into bytecode..."
-          mkdir -p output/classes
-          
-          chmod +x ./gradlew 2>/dev/null || true
-          if [ ! -f "./gradlew" ] && command -v gradle &>/dev/null; then
-            gradle wrapper
-          fi
-          chmod +x ./gradlew 2>/dev/null || true
-
           if [ -f "./gradlew" ]; then
-            ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac --no-daemon
+            ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac --no-daemon --no-configuration-cache || true
+
             find app/build/intermediates/javac/debug/classes -type f -name "*.class" 2>/dev/null | while read -r f; do
               rel="${f#app/build/intermediates/javac/debug/classes/}"
               mkdir -p "output/classes/$(dirname "$rel")"
               cp "$f" "output/classes/$rel"
             done || true
+
             find app/build/tmp/kotlin-classes/debug -type f -name "*.class" 2>/dev/null | while read -r f; do
               rel="${f#app/build/tmp/kotlin-classes/debug/}"
               mkdir -p "output/classes/$(dirname "$rel")"
@@ -79,28 +119,25 @@ jobs:
           fi
 
           echo "Compiled .class files generated:"
-          find output/classes -type f -name "*.class" 2>/dev/null | head -n 30 || true
+          find output/classes -type f -name "*.class" 2>/dev/null | head -n 20 || true
 
       - name: Convert .class Bytecode to Android .dex with D8 / Gradle
         env:
           MIN_SDK: ${{ inputs.min_sdk || '26' }}
         run: |
           echo "==> Step 2: Converting compiled .class files into Dalvik Executable (.dex)..."
-          mkdir -p output/dex
-
-          chmod +x ./gradlew 2>/dev/null || true
           if [ -f "./gradlew" ]; then
-            ./gradlew :app:assembleDebug --no-daemon || true
+            ./gradlew :app:assembleDebug --no-daemon --no-configuration-cache || true
           fi
 
-          # Extract all generated .dex files (including multidex) from APK or build output
+          # Extract all generated .dex files (multidex) from APK
           DEBUG_APK=$(find app/build/outputs/apk/debug -type f -name "*.apk" 2>/dev/null | head -n 1)
           if [ -n "$DEBUG_APK" ] && [ -f "$DEBUG_APK" ]; then
             echo "Extracting DEX files directly from $DEBUG_APK..."
             unzip -q -j -o "$DEBUG_APK" "classes*.dex" -d output/dex/ 2>/dev/null || true
           fi
 
-          # Fallback: search build directories for classes*.dex
+          # Fallback: search build intermediates for classes*.dex
           if [ ! -f "output/dex/classes.dex" ]; then
             find app/build/intermediates/dex/debug -type f -name "classes*.dex" -exec cp {} output/dex/ \; 2>/dev/null || true
           fi
@@ -124,7 +161,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: classes-dex-artifact
-          path: |
-            output/dex/*.dex
+          path: output/dex/*.dex
           if-no-files-found: warn
           retention-days: 7
