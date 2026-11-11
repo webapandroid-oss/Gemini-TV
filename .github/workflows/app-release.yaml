@@ -1,4 +1,4 @@
-name: APK Release Master Orchestrator
+name: Official Android Release Build
 
 on:
   push:
@@ -33,12 +33,10 @@ env:
   STORE_PASSWORD: "android"
   KEY_PASSWORD: "android"
   KEY_ALIAS: "upload"
-  JAVA_OPTS: "-Xms64m -Xmx256m -XX:+UseSerialGC"
-  _JAVA_OPTIONS: "-Xms64m -Xmx256m -XX:+UseSerialGC"
 
 jobs:
-  build_and_release_apk:
-    name: Direct Archiving, Assembly, Alignment and Signing
+  build_release:
+    name: Build & Release Official Android APK (AGP)
     runs-on: ubuntu-latest
 
     steps:
@@ -53,27 +51,15 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Locate Android SDK Tools (zipalign & apksigner)
-        id: setup_sdk
+      - name: Set up Android SDK Environment
         run: |
           SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "Using Android SDK at: $SDK_DIR"
 
-          BUILD_TOOLS_DIR=$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)
-          if [ -n "$BUILD_TOOLS_DIR" ]; then
-            echo "$BUILD_TOOLS_DIR" >> "$GITHUB_PATH"
-            echo "BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
-          fi
-          echo "Android Build Tools located at: $BUILD_TOOLS_DIR"
-
-      - name: Prepare Signing Keystores and Staging Workspace
-        id: prep_keystore
+      - name: Prepare Environment Secrets Configuration
         run: |
-          ROOT_DIR="$(pwd)"
-          mkdir -p "$ROOT_DIR/workspace/staging" "$ROOT_DIR/workspace/dist"
-
-          # 1. Provide .env
           if [ ! -f ".env" ]; then
             if [ -f ".env.example" ]; then
               cp .env.example .env
@@ -82,10 +68,12 @@ jobs:
             fi
           fi
 
-          # 2. Setup release keystore with alias 'upload'
+      - name: Prepare Release Signing Keystore
+        run: |
+          ROOT_DIR="$(pwd)"
           KEYSTORE_FILE="$ROOT_DIR/my-upload-key.jks"
           if [ ! -f "$KEYSTORE_FILE" ]; then
-            echo "Generating self-contained release keystore with alias 'upload'..."
+            echo "Generating release keystore..."
             keytool -genkeypair -v \
               -keystore "$KEYSTORE_FILE" \
               -alias upload \
@@ -96,127 +84,46 @@ jobs:
               -keypass "android" \
               -dname "CN=GoogleGemini, OU=AndroidTV, O=Google, L=MountainView, S=CA, C=US"
           fi
-
           echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
           echo "Release keystore confirmed at: $KEYSTORE_FILE"
 
-      - name: Direct Archiving from Compiled DEX, Manifest & Resources to ZIP & APK
-        id: archive_package
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Build Official Release APK using Android Gradle Plugin (AGP)
         run: |
-          echo "==> Step 1: Collecting compiled artifacts into staging directory..."
-          ROOT_DIR="$(pwd)"
-          STAGING="$ROOT_DIR/workspace/staging"
-          DIST="$ROOT_DIR/workspace/dist"
-          rm -rf "$STAGING"/*
-          mkdir -p "$STAGING" "$DIST"
+          echo "==> Building official release APK using root and app build.gradle.kts..."
+          ./gradlew :app:assembleRelease --stacktrace
 
-          # 1. Compiled AndroidManifest.xml (binary format - crucial)
-          if [ -f "$ROOT_DIR/output/aapt_out/AndroidManifest.xml" ]; then
-            cp "$ROOT_DIR/output/aapt_out/AndroidManifest.xml" "$STAGING/AndroidManifest.xml"
-            echo "Added compiled AndroidManifest.xml"
+      - name: Stage Official Release APKs
+        run: |
+          DIST="workspace/dist"
+          mkdir -p "$DIST"
+
+          SRC_APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$SRC_APK" ]; then
+            SRC_APK=$(find app/build/outputs/apk -name "*release*.apk" 2>/dev/null | head -n 1)
           fi
 
-          # 2. Compiled resources.arsc
-          if [ -f "$ROOT_DIR/output/aapt_out/resources.arsc" ]; then
-            cp "$ROOT_DIR/output/aapt_out/resources.arsc" "$STAGING/resources.arsc"
-            echo "Added compiled resources.arsc"
-          fi
-
-          # 3. Compiled res/ directory (drawables, layouts, mipmaps)
-          if [ -f "$ROOT_DIR/output/aapt_out/resources.apk" ]; then
-            unzip -q -o "$ROOT_DIR/output/aapt_out/resources.apk" "res/*" -d "$STAGING/" 2>/dev/null || true
-            echo "Extracted compiled res/ folder into staging"
-          fi
-
-          # 4. Dalvik Executables (multidex classes.dex through classes8.dex)
-          if ls "$ROOT_DIR/output/dex/"classes*.dex >/dev/null 2>&1; then
-            cp "$ROOT_DIR/output/dex/"classes*.dex "$STAGING/"
-            echo "Added all classes*.dex into staging"
-          fi
-
-          # 5. Native libraries (.so)
-          if [ -d "$ROOT_DIR/app/src/main/jniLibs" ]; then
-            mkdir -p "$STAGING/lib"
-            cp -r "$ROOT_DIR/app/src/main/jniLibs/"* "$STAGING/lib/"
-            echo "Added native libraries (.so) into staging"
-          fi
-
-          # Fallback check: if any core element was missing from modular directories, sync from .build-outputs
-          if [ ! -f "$STAGING/AndroidManifest.xml" ] || [ ! -f "$STAGING/resources.arsc" ] || [ ! -f "$STAGING/classes.dex" ]; then
-            BACKUP_APK=$(find "$ROOT_DIR/.build-outputs" -type f -name "*.apk" 2>/dev/null | head -n 1)
-            if [ -n "$BACKUP_APK" ] && [ -f "$BACKUP_APK" ]; then
-              echo "Synchronizing missing components from $BACKUP_APK..."
-              unzip -q -o "$BACKUP_APK" -d "$STAGING/" 2>/dev/null || true
-            fi
-          fi
-
-          # Verify mandatory compiled AndroidManifest.xml is present
-          if [ ! -f "$STAGING/AndroidManifest.xml" ]; then
-            echo "FATAL: Compiled AndroidManifest.xml is missing from staging!" >&2
+          if [ ! -f "$SRC_APK" ]; then
+            echo "ERROR: Release APK not found in build outputs!" >&2
+            find app/build/outputs -type f || true
             exit 1
           fi
 
-          echo "==> Step 2: Archiving staging contents into ZIP..."
-          ZIP_FILE="$DIST/app-unaligned.zip"
-          RAW_APK="$DIST/unaligned.apk"
+          echo "Found official AGP generated APK: $SRC_APK"
+          cp "$SRC_APK" "$DIST/gemini-tv-release.apk"
+          cp "$SRC_APK" "$DIST/2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal.apk"
 
-          (cd "$STAGING" && zip -r -0 "$ZIP_FILE" .)
-          echo "ZIP archive created:"
-          ls -lh "$ZIP_FILE"
-
-          echo "==> Step 3: Renaming .zip archive to .apk..."
-          mv "$ZIP_FILE" "$RAW_APK"
-          ls -lh "$RAW_APK"
-
-      - name: Align and Sign APK with upload-keystore (v2 + v3 scheme)
-        id: sign_apk
-        run: |
-          ROOT_DIR="$(pwd)"
-          DIST="$ROOT_DIR/workspace/dist"
-          RAW_APK="$DIST/unaligned.apk"
-          ALIGNED_APK="$DIST/aligned.apk"
-          RELEASE_APK="$DIST/gemini-tv-release.apk"
-          NAMED_APK="$DIST/2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal.apk"
-
-          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          ZIPALIGN=$(find "$SDK_DIR" -name "zipalign" -type f 2>/dev/null | sort -V | tail -n 1)
-          APKSIGNER=$(find "$SDK_DIR" -name "apksigner" -type f 2>/dev/null | sort -V | tail -n 1)
-
-          if [ -z "$ZIPALIGN" ] || [ ! -x "$ZIPALIGN" ]; then ZIPALIGN="zipalign"; fi
-          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then APKSIGNER="apksigner"; fi
-
-          echo "Using zipalign: $ZIPALIGN"
-          echo "Using apksigner: $APKSIGNER"
-
-          echo "==> Aligning APK (4-byte alignment)..."
-          "$ZIPALIGN" -f -p 4 "$RAW_APK" "$ALIGNED_APK"
-
-          echo "==> Signing APK with upload-keystore using v2 + v3 cryptographic scheme..."
-          "$APKSIGNER" sign \
-            --ks "$KEYSTORE_PATH" \
-            --ks-pass "pass:android" \
-            --ks-key-alias "upload" \
-            --key-pass "pass:android" \
-            --min-sdk-version 26 \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --out "$RELEASE_APK" \
-            "$ALIGNED_APK"
-
-          echo "==> Verifying signatures..."
-          "$APKSIGNER" verify --verbose "$RELEASE_APK"
-
-          cp "$RELEASE_APK" "$NAMED_APK"
-          echo "Successfully generated production release APKs in $DIST:"
+          echo "Official release APKs staged in $DIST:"
           ls -lh "$DIST/"*.apk
 
-      - name: Upload Final APK Artifacts to GitHub Actions
+      - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gemini-tv-release-apk
           path: workspace/dist/*.apk
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
       - name: Auto-Publish Release via GitHub CLI
@@ -256,7 +163,7 @@ jobs:
             echo "Creating new GitHub Release $TAG..."
             gh release create "$TAG" "$RELEASE_APK" "$NAMED_APK" \
               --title "$TITLE" \
-              --notes "Official Google Gemini Universal Release ($TAG) with pure Kotlin AI integration and Nano Banana image generator." \
+              --notes "Official Google Gemini Universal Release ($TAG) built with official Android Gradle Plugin (AGP)." \
               --latest || echo "Warning: Release creation logged."
           fi
 
