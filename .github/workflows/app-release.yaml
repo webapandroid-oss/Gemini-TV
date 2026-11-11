@@ -126,45 +126,52 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Auto-Publish Release via GitHub CLI
-        id: publish_release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_TAG: ${{ inputs.release_tag }}
-          INPUT_TITLE: ${{ inputs.release_title }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+      - name: Determine Release Metadata
+        id: release_meta
         run: |
-          echo "==> Publishing Release to GitHub..."
-          if [ -n "$INPUT_TAG" ]; then
-            TAG="$INPUT_TAG"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TAG="$GITHUB_REF_NAME"
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
           else
             TAG="v2.0.1.1.0"
           fi
 
-          if [ -n "$INPUT_TITLE" ]; then
-            TITLE="$INPUT_TITLE"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TITLE="Google Gemini $GITHUB_REF_NAME Release"
+          if [ -n "${{ inputs.release_title }}" ]; then
+            TITLE="${{ inputs.release_title }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TITLE="Google Gemini ${{ github.ref_name }} Release"
           else
             TITLE="Google Gemini v2.0.1.1.0 Universal Release"
           fi
 
-          RELEASE_APK="workspace/dist/gemini-tv-release.apk"
-          NAMED_APK="workspace/dist/2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal.apk"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Target Release Tag: $TAG"
+          echo "Target Release Title: $TITLE"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG exists. Uploading updated APK assets..."
-            gh release upload "$TAG" "$RELEASE_APK" "$NAMED_APK" --clobber || echo "Warning: Upload to release completed."
-          else
-            echo "Creating new GitHub Release $TAG..."
-            gh release create "$TAG" "$RELEASE_APK" "$NAMED_APK" \
-              --title "$TITLE" \
-              --notes "Official Google Gemini Universal Release ($TAG) built with official Android Gradle Plugin (AGP)." \
-              --latest || echo "Warning: Release creation logged."
-          fi
+      - name: Publish Official GitHub Release
+        id: publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.title }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            ## Google Gemini Android TV Universal Release
+            Official production release built using the Android Gradle Plugin (AGP).
 
-          echo "GitHub Release step completed successfully!"
+            - **Release Tag:** `${{ steps.release_meta.outputs.tag }}`
+            - **Commit SHA:** `${{ github.sha }}`
+
+            ### Included APK Downloads:
+            - `gemini-tv-release.apk` (Standard Release Package)
+            - `2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal.apk` (Universal Architecture Package)
+          files: |
+            workspace/dist/gemini-tv-release.apk
+            workspace/dist/2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal.apk
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
