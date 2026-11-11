@@ -1,0 +1,6 @@
+{
+  "name": "Gemini TV",
+  "description": "Google Gemini AI assistant for Android TV with interactive chat, voice dictation, text-to-speech, and image generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
