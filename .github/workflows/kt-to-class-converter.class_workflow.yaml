@@ -1,0 +1,79 @@
+name: "Step 2: Kotlin to Class Converter"
+
+on:
+  workflow_run:
+    workflows: ["Step 1: AAPT2 Resource Compiler & Linker"]
+    types:
+      - completed
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: kt-to-class-converter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  convert_kt_to_classes:
+    name: Compile Kotlin & Java Sources to .class Bytecode
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Prepare Environment Secrets
+        run: |
+          if [ ! -f ".env" ]; then
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+            else
+              touch .env
+            fi
+          fi
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Compile Kotlin and Java Sources to .class Files
+        run: |
+          echo "==> Compiling Kotlin & Java sources to .class bytecode via Gradle..."
+          ./gradlew :app:kspReleaseKotlin :app:compileReleaseKotlin :app:compileReleaseJavaWithJavac --stacktrace
+
+      - name: Harvest and Organize .class Files
+        run: |
+          CLASSES_DIR="output/classes"
+          mkdir -p "$CLASSES_DIR"
+          
+          echo "==> Collecting compiled Kotlin & Java .class files..."
+          # Copy Kotlin compiled classes
+          if [ -d "app/build/tmp/kotlin-classes/release" ]; then
+            cp -r app/build/tmp/kotlin-classes/release/* "$CLASSES_DIR/" 2>/dev/null || true
+          fi
+          
+          # Copy Java compiled classes
+          if [ -d "app/build/intermediates/javac/release/classes" ]; then
+            cp -r app/build/intermediates/javac/release/classes/* "$CLASSES_DIR/" 2>/dev/null || true
+          fi
+          
+          CLASS_COUNT=$(find "$CLASSES_DIR" -type f -name "*.class" | wc -l)
+          echo "==> Successfully collected $CLASS_COUNT compiled .class files in $CLASSES_DIR:"
+          find "$CLASSES_DIR" -type f -name "*.class" | head -n 30
+
+      - name: Upload Compiled .class Files Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-classes-artifact
+          path: output/classes/
+          if-no-files-found: error
+          retention-days: 7

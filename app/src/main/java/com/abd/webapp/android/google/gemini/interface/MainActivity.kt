@@ -138,7 +138,7 @@ fun GeminiAppScreen(
     mutableStateOf(sharedPrefs.getString("api_key", "") ?: "")
   }
   var selectedModel by remember {
-    mutableStateOf(sharedPrefs.getString("model_name", "gemini-2.5-flash") ?: "gemini-2.5-flash")
+    mutableStateOf(sharedPrefs.getString("model_name", "gemini-2.0-flash") ?: "gemini-2.0-flash")
   }
   var autoSpeak by remember {
     mutableStateOf(sharedPrefs.getBoolean("auto_speak", false))
@@ -348,7 +348,7 @@ fun GeminiAppScreen(
               )
               Spacer(modifier = Modifier.width(6.dp))
               Text(
-                text = "Gemini 2.5",
+                text = "Gemini 2.0",
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
                 color = Color(0xFFE2E8F0)
@@ -643,7 +643,7 @@ fun GeminiAppScreen(
 
           Text("Model Selection:", fontSize = 13.sp, color = Color(0xFF94A3B8))
           Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash").forEach { mod ->
+            listOf("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro").forEach { mod ->
               FilterChip(
                 selected = tempModel == mod,
                 onClick = { tempModel = mod },

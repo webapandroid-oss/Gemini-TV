@@ -16,8 +16,8 @@ android {
     applicationId = "com.abd.webapp.android.google.gemini.interface"
     minSdk = 26
     targetSdk = 35
-    versionCode = 4
-    versionName = "2.0.1.1.0_google_gemini_20261031_5_native_gemini_lib_universal"
+    versionCode = 5
+    versionName = "2.1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
