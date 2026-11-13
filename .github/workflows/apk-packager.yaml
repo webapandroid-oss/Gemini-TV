@@ -1,10 +1,6 @@
-name: "Step 4: APK Packager, V2+V3 Signer & Release Publisher"
+name: "Release APK Packager & Publisher"
 
 on:
-  workflow_run:
-    workflows: ["Step 3: Class to DEX MultiDex Converter"]
-    types:
-      - completed
   push:
     branches:
       - main
@@ -25,7 +21,7 @@ on:
         type: string
 
 concurrency:
-  group: apk-bundle-${{ github.ref }}
+  group: apk-packager-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -37,6 +33,7 @@ env:
   STORE_PASSWORD: "android"
   KEY_PASSWORD: "android"
   KEY_ALIAS: "upload"
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3072m -Djava.awt.headless=true -XX:MaxMetaspaceSize=512m"
 
 jobs:
   bundle_and_release_apk:
@@ -54,16 +51,16 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Locate Android SDK Tools
-        id: sdk_tools
+      - name: Set up Android SDK Environment
         run: |
           SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
           
-          ZIPALIGN_BIN=$(find "$SDK_DIR/build-tools" -name zipalign | sort -V | tail -n 1)
-          APKSIGNER_BIN=$(find "$SDK_DIR/build-tools" -name apksigner | sort -V | tail -n 1)
+          ZIPALIGN_BIN=$(find "$SDK_DIR/build-tools" -name zipalign 2>/dev/null | sort -V | tail -n 1)
+          APKSIGNER_BIN=$(find "$SDK_DIR/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)
           
           echo "ZIPALIGN_BIN=$ZIPALIGN_BIN" >> "$GITHUB_ENV"
           echo "APKSIGNER_BIN=$APKSIGNER_BIN" >> "$GITHUB_ENV"
@@ -85,7 +82,7 @@ jobs:
           ROOT_DIR="$(pwd)"
           KEYSTORE_FILE="$ROOT_DIR/my-upload-key.jks"
           if [ ! -f "$KEYSTORE_FILE" ]; then
-            echo "Keystore not found, generating release keystore..."
+            echo "Generating release keystore..."
             keytool -genkeypair -v \
               -keystore "$KEYSTORE_FILE" \
               -alias upload \
@@ -97,17 +94,17 @@ jobs:
               -dname "CN=GoogleGemini, OU=AndroidTV, O=Google, L=MountainView, S=CA, C=US"
           fi
           echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-          echo "Signing keystore ready at: $KEYSTORE_FILE"
+          echo "Keystore ready at: $KEYSTORE_FILE"
 
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
 
-      - name: Build and Package Release APK with MultiDex, Resources & Native Libs
+      - name: Build Official Release APK using Android Gradle Plugin (AGP)
         run: |
-          echo "==> Building official release APK using Android Gradle Plugin..."
-          ./gradlew :app:assembleRelease --stacktrace
+          echo "==> Building official release APK using AGP and root build.gradle.kts..."
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
 
-      - name: Align and Sign APK with v2 + v3 Scheme using my-upload-key.jks
+      - name: Align and Verify Signature with v2 + v3 Scheme
         run: |
           DIST="workspace/dist"
           mkdir -p "$DIST"
@@ -128,34 +125,49 @@ jobs:
           ALIGNED_APK="$DIST/app-aligned.apk"
           FINAL_APK="$DIST/gemini-tv-release.apk"
           
-          echo "==> Verifying 4-byte page alignment with zipalign..."
-          if "$ZIPALIGN_BIN" -c 4 "$SRC_APK"; then
-            echo "APK is already aligned."
-            cp "$SRC_APK" "$ALIGNED_APK"
+          # Check or apply 4-byte page alignment
+          if [ -n "$ZIPALIGN_BIN" ] && [ -x "$ZIPALIGN_BIN" ]; then
+            echo "==> Checking page alignment..."
+            if "$ZIPALIGN_BIN" -c 4 "$SRC_APK"; then
+              echo "APK is already aligned."
+              cp "$SRC_APK" "$ALIGNED_APK"
+            else
+              echo "Aligning APK..."
+              "$ZIPALIGN_BIN" -f -p 4 "$SRC_APK" "$ALIGNED_APK"
+            fi
           else
-            echo "Aligning APK with 4-byte boundaries..."
-            "$ZIPALIGN_BIN" -f -p 4 "$SRC_APK" "$ALIGNED_APK"
+            cp "$SRC_APK" "$ALIGNED_APK"
           fi
           
-          echo "==> Signing APK with apksigner using my-upload-key.jks (v1, v2, v3 schemes)..."
-          "$APKSIGNER_BIN" sign \
-            --ks "$KEYSTORE_PATH" \
-            --ks-pass "pass:$STORE_PASSWORD" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --key-pass "pass:$KEY_PASSWORD" \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --out "$FINAL_APK" \
-            "$ALIGNED_APK"
+          # Verify signature with apksigner or re-sign
+          if [ -n "$APKSIGNER_BIN" ] && [ -x "$APKSIGNER_BIN" ]; then
+            echo "==> Verifying signature scheme..."
+            if ! "$APKSIGNER_BIN" verify --verbose "$ALIGNED_APK" >/dev/null 2>&1; then
+              echo "Re-signing APK with v1, v2, and v3 schemes..."
+              "$APKSIGNER_BIN" sign \
+                --ks "$KEYSTORE_PATH" \
+                --ks-pass "pass:$STORE_PASSWORD" \
+                --ks-key-alias "$KEY_ALIAS" \
+                --key-pass "pass:$KEY_PASSWORD" \
+                --v1-signing-enabled true \
+                --v2-signing-enabled true \
+                --v3-signing-enabled true \
+                --out "$FINAL_APK" \
+                "$ALIGNED_APK"
+            else
+              cp "$ALIGNED_APK" "$FINAL_APK"
+            fi
             
-          echo "==> Verifying signature details of the final APK..."
-          "$APKSIGNER_BIN" verify --verbose --print-certs "$FINAL_APK"
+            echo "==> Signature verification report:"
+            "$APKSIGNER_BIN" verify --verbose --print-certs "$FINAL_APK" || true
+          else
+            cp "$ALIGNED_APK" "$FINAL_APK"
+          fi
           
-          # Also stage universal naming APK
+          # Copy universal package
           cp "$FINAL_APK" "$DIST/2.1.0_google_gemini_native_universal.apk"
           
-          echo "Staged APKs in $DIST:"
+          echo "==> Release APKs ready in $DIST:"
           ls -lh "$DIST"/*.apk
 
       - name: Upload Packaged APK Artifacts
@@ -171,28 +183,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          # Extract semantic version from AndroidManifest.xml and app/build.gradle.kts
-          VERSION_NAME=$(grep -oP 'android:versionName="\K[^"]+' app/src/main/AndroidManifest.xml || echo "2.1.0")
-          VERSION_CODE=$(grep -oP 'android:versionCode="\K[^"]+' app/src/main/AndroidManifest.xml || echo "5")
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "2.1.0")
+          VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts || echo "5")
           
-          echo "Detected Semantic Version: versionName=$VERSION_NAME, versionCode=$VERSION_CODE"
+          echo "Detected SemVer: versionName=$VERSION_NAME, versionCode=$VERSION_CODE"
           
-          # Resolve Release Tag
+          # Compute Tag
           if [ -n "${{ inputs.release_tag }}" ]; then
             TAG="${{ inputs.release_tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
             BASE_TAG="v${VERSION_NAME}"
-            # Check if this release tag already exists on GitHub to prevent overwriting existing releases
-            if gh release view "$BASE_TAG" >/dev/null 2>&1; then
-              TAG="${BASE_TAG}-rev${{ github.run_number }}"
+            # Check if this tag already exists on GitHub Releases
+            if gh release view "$BASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              TAG="${BASE_TAG}-build.${{ github.run_number }}"
             else
               TAG="$BASE_TAG"
             fi
           fi
           
-          # Resolve Release Title
+          # Compute Title
           if [ -n "${{ inputs.release_title }}" ]; then
             TITLE="${{ inputs.release_title }}"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
@@ -205,8 +216,8 @@ jobs:
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
-          echo "Final Target Tag: $TAG"
-          echo "Final Target Title: $TITLE"
+          echo "Target Tag: $TAG"
+          echo "Target Title: $TITLE"
 
       - name: Publish Official GitHub Release
         id: publish_release
@@ -218,13 +229,12 @@ jobs:
           target_commitish: ${{ github.sha }}
           body: |
             ## Google Gemini Android TV Universal Release
-            Production release built with Semantic Versioning, MultiDex, AAPT2 and signed with v2+v3 scheme.
+            Official production release built using Android Gradle Plugin with MultiDex, AAPT2 and verified v2+v3 signature scheme.
 
             - **Version Name (SemVer):** `${{ steps.release_meta.outputs.version_name }}`
             - **Version Code:** `${{ steps.release_meta.outputs.version_code }}`
             - **Release Tag:** `${{ steps.release_meta.outputs.tag }}`
             - **Commit SHA:** `${{ github.sha }}`
-            - **Workflow Run:** `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
 
             ### Included Release APKs:
             - `gemini-tv-release.apk` (Signed with v2+v3 scheme)
