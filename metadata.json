@@ -1,6 +1,6 @@
 {
   "name": "Gemini TV",
-  "description": "Google Gemini AI assistant for Android TV with interactive chat, voice dictation, text-to-speech, and image generation.",
+  "description": "Google Gemini 3.8 & 3.8 Pro AI assistant (v3.0.0) for Android & Android TV with interactive chat, voice dictation, text-to-speech, and Nano Banana image generation.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

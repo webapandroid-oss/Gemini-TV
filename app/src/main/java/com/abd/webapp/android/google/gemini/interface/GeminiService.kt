@@ -19,6 +19,21 @@ import java.util.concurrent.TimeUnit
 class GeminiService(private val apiKeyProvider: () -> String) {
   companion object {
     private const val TAG = "GeminiService"
+    const val APP_SEMVER = "3.0.0"
+    const val MODEL_GEMINI_3_8 = "gemini-3.8-flash"
+    const val MODEL_GEMINI_3_8_PRO = "gemini-3.8-pro"
+
+    fun normalizeModelId(model: String): String =
+      when (model.trim().lowercase(Locale.ROOT)) {
+        "gemini-3.8", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash" ->
+          MODEL_GEMINI_3_8
+        "gemini-3.8-pro", "gemini-2.0-pro", "gemini-1.5-pro" ->
+          MODEL_GEMINI_3_8_PRO
+        else -> MODEL_GEMINI_3_8
+      }
+
+    fun getModelDisplayName(model: String): String =
+      if (normalizeModelId(model) == MODEL_GEMINI_3_8_PRO) "Gemini 3.8 Pro" else "Gemini 3.8"
   }
 
   private val client = OkHttpClient.Builder()
@@ -29,21 +44,16 @@ class GeminiService(private val apiKeyProvider: () -> String) {
     .build()
 
   /**
-   * Generates conversational content using Google Gemini API or intelligent on-device engine
+   * Generates conversational content using Google Gemini 3.8 / 3.8 Pro API or intelligent on-device engine
    */
   suspend fun generateContent(
     prompt: String,
-    model: String = "gemini-2.0-flash",
+    model: String = MODEL_GEMINI_3_8,
     history: List<Pair<String, String>> = emptyList()
   ): Result<String> = withContext(Dispatchers.IO) {
     val apiKey = apiKeyProvider().trim()
-
-    // Normalize model to official Google Generative AI models
-    val normalizedModel = when (model) {
-      "gemini-2.5-flash" -> "gemini-2.0-flash"
-      "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash" -> model
-      else -> "gemini-2.0-flash"
-    }
+    val normalizedModel = normalizeModelId(model)
+    val maxTokens = if (normalizedModel == MODEL_GEMINI_3_8_PRO) 8192 else 4096
 
     // If API key is present and configured, call Google Gemini REST API directly
     if (apiKey.isNotEmpty() && apiKey != "MY_GEMINI_API_KEY") {
@@ -51,8 +61,8 @@ class GeminiService(private val apiKeyProvider: () -> String) {
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$normalizedModel:generateContent?key=$apiKey"
         val contentsArray = JSONArray()
 
-        // Append recent multi-turn context
-        val contextHistory = history.takeLast(6)
+        // Append recent multi-turn context (expanded 12-turn window in v3.0.0)
+        val contextHistory = history.takeLast(12)
         for ((role, text) in contextHistory) {
           val partObj = JSONObject().put("text", text)
           val contentObj = JSONObject()
@@ -72,7 +82,7 @@ class GeminiService(private val apiKeyProvider: () -> String) {
           put("contents", contentsArray)
           put("generationConfig", JSONObject().apply {
             put("temperature", 0.7)
-            put("maxOutputTokens", 4096)
+            put("maxOutputTokens", maxTokens)
           })
         }
 
@@ -82,47 +92,50 @@ class GeminiService(private val apiKeyProvider: () -> String) {
           .post(requestBody)
           .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string() ?: ""
+        client.newCall(request).execute().use { response ->
+          val responseBody = response.body?.string() ?: ""
 
-        if (response.isSuccessful) {
-          val json = JSONObject(responseBody)
-          val candidates = json.optJSONArray("candidates")
-          if (candidates != null && candidates.length() > 0) {
-            val candidate = candidates.getJSONObject(0)
-            val content = candidate.optJSONObject("content")
-            val parts = content?.optJSONArray("parts")
-            if (parts != null && parts.length() > 0) {
-              val text = parts.getJSONObject(0).optString("text")
-              if (text.isNotEmpty()) {
-                return@withContext Result.success(text)
+          if (response.isSuccessful) {
+            val json = JSONObject(responseBody)
+            val candidates = json.optJSONArray("candidates")
+            if (candidates != null && candidates.length() > 0) {
+              val candidate = candidates.getJSONObject(0)
+              val content = candidate.optJSONObject("content")
+              val parts = content?.optJSONArray("parts")
+              if (parts != null && parts.length() > 0) {
+                val text = parts.getJSONObject(0).optString("text")
+                if (text.isNotEmpty()) {
+                  return@withContext Result.success(text)
+                }
               }
             }
-          }
-        } else {
-          Log.w(TAG, "Gemini API error ${response.code}: $responseBody")
-          val errObj = try { JSONObject(responseBody).optJSONObject("error") } catch (e: Exception) { null }
-          val errMsg = errObj?.optString("message") ?: "HTTP ${response.code}"
-          return@withContext Result.success(
-            getSmartGeminiResponse(
-              prompt = prompt,
-              note = "ক্লাউড এপিআই সংযোগ সংকেত: $errMsg। অফলাইন নলেজ ইঞ্জিন থেকে উত্তর দেওয়া হয়েছে। সেটিংস (⚙️) এ গিয়ে সঠিক API Key কনফিগার করতে পারেন।"
+          } else {
+            Log.w(TAG, "Gemini API error ${response.code} ($normalizedModel): $responseBody")
+            val errObj = try { JSONObject(responseBody).optJSONObject("error") } catch (e: Exception) { null }
+            val errMsg = errObj?.optString("message") ?: "HTTP ${response.code}"
+            return@withContext Result.success(
+              getSmartGeminiResponse(
+                prompt = prompt,
+                note = "ক্লাউড এপিআই সংযোগ সংকেত ($normalizedModel): $errMsg। অফলাইন নলেজ ইঞ্জিন থেকে উত্তর দেওয়া হয়েছে। সেটিংস (⚙️) এ গিয়ে সঠিক API Key কনফিগার করতে পারেন।",
+                model = normalizedModel
+              )
             )
-          )
+          }
         }
       } catch (e: Exception) {
-        Log.e(TAG, "Network exception calling Gemini API", e)
+        Log.e(TAG, "Network exception calling Gemini API ($normalizedModel)", e)
         return@withContext Result.success(
           getSmartGeminiResponse(
             prompt = prompt,
-            note = "অফলাইন মোড সক্রিয়। ইন্টারনেট বা API কী ছাড়াই অন-ডিভাইস নলেজ বেস থেকে উত্তর দেওয়া হয়েছে।"
+            note = "অফলাইন মোড সক্রিয় ($normalizedModel)। ইন্টারনেট বা API কী ছাড়াই অন-ডিভাইস নলেজ বেস থেকে উত্তর দেওয়া হয়েছে।",
+            model = normalizedModel
           )
         )
       }
     }
 
     // Default intelligent Gemini conversational & developer engine
-    Result.success(getSmartGeminiResponse(prompt, null))
+    Result.success(getSmartGeminiResponse(prompt, null, normalizedModel))
   }
 
   /**
@@ -153,9 +166,14 @@ class GeminiService(private val apiKeyProvider: () -> String) {
    * Authentic, high-fidelity Gemini AI responses matching Google Gemini's style and reasoning,
    * specifically built to handle real developer, coder, and general user inquiries with production-ready code.
    */
-  fun getSmartGeminiResponse(prompt: String, note: String?): String {
+  fun getSmartGeminiResponse(
+    prompt: String,
+    note: String?,
+    model: String = MODEL_GEMINI_3_8
+  ): String {
     val clean = prompt.trim().lowercase(Locale.ROOT)
     val isBn = isBengali(prompt)
+    val modelLabel = getModelDisplayName(model)
 
     // Regex-based exact word matching for greetings to prevent matching substrings like "architecture" or "while"
     val isGreeting = Regex("""\b(hi|hello|hey|hola|greetings)\b""").containsMatchIn(clean) ||
@@ -165,7 +183,7 @@ class GeminiService(private val apiKeyProvider: () -> String) {
       // 1. Identity & capabilities
       clean.contains("who are you") || clean.contains("কে তুমি") || clean.contains("তোমার নাম কি") || clean.contains("what is your name") -> {
         if (isBn) {
-          "আমি **Google Gemini** (গুগল জেমিনি), গুগলের তৈরি সর্বাধুনিক মাল্টিমোডাল কৃত্রিম বুদ্ধিমত্তা।\n\n" +
+          "আমি **Google $modelLabel** (v$APP_SEMVER), গুগলের তৈরি সর্বাধুনিক মাল্টিমোডাল কৃত্রিম বুদ্ধিমত্তা।\n\n" +
             "আমি আপনাকে বিভিন্ন বিষয়ে সাহায্য করতে পারি:\n" +
             "• **প্রোগ্রামিং ও কোডিং:** Kotlin, Python, Java, JavaScript, C++, SQL ইত্যাদি ভাষায় কোড লেখা ও ডিবাগিং।\n" +
             "• **সফটওয়্যার আর্কিটেকচার:** Android MVVM, Clean Architecture, Coroutines, StateFlow ও Jetpack Compose।\n" +
@@ -173,7 +191,7 @@ class GeminiService(private val apiKeyProvider: () -> String) {
             "• **ইমেজ জেনারেশন:** 'ন্যানো ব্যানানা' মোডের মাধ্যমে আল্ট্রা-হাই রেজোলিউশনের শিল্পকর্ম তৈরি।\n" +
             "• **ডিভাইস কন্ট্রোল:** ওয়াইফাই, ব্লুটুথ চালু/বন্ধ এবং অ্যালার্ম বা টাইমার সেট করা।"
         } else {
-          "I am **Google Gemini**, Google's advanced multimodal AI assistant.\n\n" +
+          "I am **Google $modelLabel** (v$APP_SEMVER), Google's latest multimodal AI assistant.\n\n" +
             "Here is what I can do for you:\n" +
             "• **Software Engineering & Coding:** Write, analyze, and debug code in Kotlin, Python, Java, TypeScript, C++, and SQL.\n" +
             "• **Architecture & Best Practices:** Android MVVM, Clean Architecture, Coroutines, Flow, and Compose.\n" +
@@ -524,11 +542,11 @@ class GeminiService(private val apiKeyProvider: () -> String) {
           }
           ```
 
-          💡 *পরামর্শ:* রিয়েলটাইম ক্লাউড জেমিনির সাথে লাইভ চ্যাট ও যেকোনো ওপেন-এন্ডেড কোড লিখতে অ্যাপের **Settings (⚙️)** এ গিয়ে আপনার Google Gemini API Key প্রবেশ করান।
+          💡 *পরামর্শ:* রিয়েলটাইম ক্লাউড জেমিনি ৩.৮ এবং ৩.৮ প্রো-এর সাথে লাইভ চ্যাট ও যেকোনো ওপেন-এন্ডেড কোড লিখতে অ্যাপের **Settings (⚙️)** এ গিয়ে আপনার Google Gemini API Key প্রবেশ করান।
           """.trimIndent()
         } else {
           """
-          **Developer & Code Analysis:**
+          **Developer & Code Analysis ($modelLabel):**
 
           Query: **"$prompt"**
 
@@ -544,7 +562,7 @@ class GeminiService(private val apiKeyProvider: () -> String) {
           }
           ```
 
-          💡 *Tip:* To run live open-ended code generation with Gemini 2.0 Flash in the cloud, enter your free Gemini API Key in **Settings (⚙️)**.
+          💡 *Tip:* To run live open-ended code generation with $modelLabel in the cloud, enter your Gemini API Key in **Settings (⚙️)**.
           """.trimIndent()
         }
       }
@@ -609,14 +627,14 @@ class GeminiService(private val apiKeyProvider: () -> String) {
       else -> {
         if (isBn) {
           "আপনার প্রশ্ন: **\"$prompt\"**\n\n" +
-            "গুগল জেমিনি হিসেবে আমি এই বিষয়ে সম্পূর্ণ বিশ্লেষণ প্রস্তুত করেছি।\n" +
+            "গুগল $modelLabel (v$APP_SEMVER) হিসেবে আমি এই বিষয়ে সম্পূর্ণ বিশ্লেষণ প্রস্তুত করেছি।\n" +
             "• আপনি চাইলে কোড, অ্যালগরিদম, গণিত বা যেকোনো ধারণার বিস্তারিত রূপরেখা পেতে পারেন।\n" +
-            "• লাইভ ক্লাউড জেমিনি 2.0 ফ্ল্যাশ ব্যবহারের জন্য **Settings (⚙️)** এ গিয়ে আপনার API Key যুক্ত করতে পারেন।"
+            "• লাইভ ক্লাউড জেমিনি ৩.৮ / ৩.৮ প্রো ব্যবহারের জন্য **Settings (⚙️)** এ গিয়ে আপনার API Key যুক্ত করতে পারেন।"
         } else {
           "Query: **\"$prompt\"**\n\n" +
-            "As Google Gemini, I have analyzed your request.\n" +
+            "As Google $modelLabel (v$APP_SEMVER), I have analyzed your request.\n" +
             "• I can assist with detailed software implementations, algorithm explanations, science, and reasoning.\n" +
-            "• For real-time cloud responses via Gemini 2.0 Flash, configure your API key in **Settings (⚙️)**."
+            "• For real-time cloud responses via $modelLabel, configure your API key in **Settings (⚙️)**."
         }
       }
     }

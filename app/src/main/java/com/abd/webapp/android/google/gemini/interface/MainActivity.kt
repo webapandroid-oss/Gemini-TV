@@ -1,9 +1,6 @@
 package com.abd.webapp.android.google.gemini.`interface`
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,57 +11,89 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.NewReleases
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.abd.webapp.android.google.gemini.`interface`.ui.theme.MyApplicationTheme
-import kotlinx.coroutines.launch
 import java.util.Locale
-
-data class ChatMessage(
-  val id: String = System.currentTimeMillis().toString(),
-  val sender: MessageSender,
-  val text: String,
-  val imageUrl: String? = null,
-  val isImage: Boolean = false,
-  val timestamp: Long = System.currentTimeMillis()
-)
-
-enum class MessageSender {
-  USER, GEMINI
-}
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
@@ -72,6 +101,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
   private var isTtsReady = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    enableEdgeToEdge(
+      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+    )
     super.onCreate(savedInstanceState)
     try {
       tts = TextToSpeech(this, this)
@@ -79,13 +112,21 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     setContent {
       MyApplicationTheme(darkTheme = true) {
-        GeminiAppScreen(
+        val viewModel: GeminiViewModel = viewModel()
+        GeminiTvScreen(
+          viewModel = viewModel,
           onSpeak = { text -> speakText(text) },
           onStopSpeak = { stopSpeaking() },
           activity = this
         )
       }
     }
+  }
+
+  override fun onStop() {
+    // Pause TTS audio playback when Android TV enters standby / low-power mode
+    stopSpeaking()
+    super.onStop()
   }
 
   override fun onInit(status: Int) {
@@ -121,158 +162,66 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
   }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun GeminiAppScreen(
+fun GeminiTvScreen(
+  viewModel: GeminiViewModel,
   onSpeak: (String) -> Unit,
   onStopSpeak: () -> Unit,
   activity: ComponentActivity
 ) {
+  val uiState by viewModel.uiState.collectAsStateWithLifecycle()
   val context = LocalContext.current
-  val coroutineScope = rememberCoroutineScope()
+  val focusManager = LocalFocusManager.current
+  val keyboardController = LocalSoftwareKeyboardController.current
   val listState = rememberLazyListState()
 
-  // Preferences
-  val sharedPrefs = remember { context.getSharedPreferences("gemini_prefs", Context.MODE_PRIVATE) }
-  var apiKey by remember {
-    mutableStateOf(sharedPrefs.getString("api_key", "") ?: "")
-  }
-  var selectedModel by remember {
-    mutableStateOf(sharedPrefs.getString("model_name", "gemini-2.0-flash") ?: "gemini-2.0-flash")
-  }
-  var autoSpeak by remember {
-    mutableStateOf(sharedPrefs.getBoolean("auto_speak", false))
+  var inputValue by remember { mutableStateOf(TextFieldValue("")) }
+  var isInputFocused by remember { mutableStateOf(false) }
+  val initialFocusRequester = remember { FocusRequester() }
+  val inputFocusRequester = remember { FocusRequester() }
+
+  // Request initial TV remote focus on launch so the user sees an active D-pad cursor immediately
+  LaunchedEffect(Unit) {
+    try {
+      initialFocusRequester.requestFocus()
+    } catch (_: Exception) {}
   }
 
-  // Gemini Service instance
-  val geminiService = remember {
-    GeminiService {
-      if (apiKey.isNotEmpty()) apiKey else {
-        try {
-          val buildConfigClass = Class.forName("com.example.BuildConfig")
-          (buildConfigClass.getField("GEMINI_API_KEY").get(null) as? String) ?: ""
-        } catch (_: Exception) { "" }
-      }
+  // Keep latest message scrolled into view
+  LaunchedEffect(uiState.messages.size, uiState.isThinking) {
+    if (uiState.messages.isNotEmpty()) {
+      listState.animateScrollToItem(uiState.messages.lastIndex)
     }
   }
 
-  // UI States
-  var currentMode by remember { mutableStateOf("chat") } // "chat", "image", "voice"
-  var inputText by remember { mutableStateOf("") }
-  var isThinking by remember { mutableStateOf(false) }
-  var isSpeakingAudio by remember { mutableStateOf(false) }
-  var isListeningMic by remember { mutableStateOf(false) }
-  var showSettingsDialog by remember { mutableStateOf(false) }
-  val messages = remember { mutableStateListOf<ChatMessage>() }
+  // Handle TV Remote Back button cleanly across modes
+  BackHandler(enabled = uiState.currentMode != "chat") {
+    viewModel.setMode("chat")
+  }
 
-  // Speech Recognizer
-  var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
   val micPermissionLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.RequestPermission()
   ) { isGranted ->
     if (isGranted) {
-      startSpeechListening(context, { isListeningMic = it }, { text ->
-        inputText = text
-      })
+      startSpeechListening(
+        context = context,
+        onListeningState = { viewModel.setListeningMic(it) },
+        onResult = { text ->
+          inputValue = TextFieldValue(text, TextRange(text.length))
+        }
+      )
     } else {
       Toast.makeText(context, "Microphone permission required for voice dictation", Toast.LENGTH_SHORT).show()
     }
   }
 
-  // Send message action
-  fun handleSend(promptText: String) {
-    val cleanPrompt = promptText.trim()
-    if (cleanPrompt.isEmpty() || isThinking) return
-
-    val isImageQuery = currentMode == "image" ||
-      cleanPrompt.contains("ন্যানো ব্যানানা", ignoreCase = true) ||
-      cleanPrompt.contains("nano banana", ignoreCase = true) ||
-      cleanPrompt.contains("ছবি আঁকো", ignoreCase = true) ||
-      cleanPrompt.contains("draw image", ignoreCase = true) ||
-      cleanPrompt.contains("generate image", ignoreCase = true)
-
-    // Append User Message
-    messages.add(ChatMessage(sender = MessageSender.USER, text = cleanPrompt))
-    inputText = ""
-    isThinking = true
-
-    coroutineScope.launch {
-      listState.animateScrollToItem(maxOf(0, messages.size - 1))
-
-      // Check device actions first (Wi-Fi, Bluetooth, Alarm)
-      val lower = cleanPrompt.lowercase(Locale.ROOT)
-      if (lower.contains("wifi") || lower.contains("ওয়াইফাই")) {
-        val enable = lower.contains("চালু") || lower.contains("on") || lower.contains("অন")
-        val action = if (enable) "ACTION_WIFI_ON" else "ACTION_WIFI_OFF"
-        val feedback = GeminiProcessor.executeDeviceAction(action, "", activity)
-        messages.add(ChatMessage(sender = MessageSender.GEMINI, text = "⚙️ $feedback"))
-        isThinking = false
-        listState.animateScrollToItem(maxOf(0, messages.size - 1))
-        return@launch
-      } else if (lower.contains("bluetooth") || lower.contains("ব্লুটুথ")) {
-        val enable = lower.contains("চালু") || lower.contains("on") || lower.contains("অন")
-        val action = if (enable) "ACTION_BLUETOOTH_ON" else "ACTION_BLUETOOTH_OFF"
-        val feedback = GeminiProcessor.executeDeviceAction(action, "", activity)
-        messages.add(ChatMessage(sender = MessageSender.GEMINI, text = "🔵 $feedback"))
-        isThinking = false
-        listState.animateScrollToItem(maxOf(0, messages.size - 1))
-        return@launch
-      } else if (lower.contains("alarm") || lower.contains("অ্যালার্ম")) {
-        val feedback = GeminiProcessor.executeDeviceAction("ACTION_SET_ALARM", cleanPrompt, activity)
-        messages.add(ChatMessage(sender = MessageSender.GEMINI, text = "⏰ $feedback"))
-        isThinking = false
-        listState.animateScrollToItem(maxOf(0, messages.size - 1))
-        return@launch
-      }
-
-      if (isImageQuery) {
-        // Nano Banana Image Generation
-        val imageResult = geminiService.generateNanoBananaImage(cleanPrompt)
-        imageResult.onSuccess { url ->
-          messages.add(
-            ChatMessage(
-              sender = MessageSender.GEMINI,
-              text = "🍌 **ন্যানো ব্যানানা (Nano Banana) এআই ইমেজ তৈরি সম্পন্ন!**\n\nপ্রম্পট: \"$cleanPrompt\"",
-              imageUrl = url,
-              isImage = true
-            )
-          )
-        }.onFailure { err ->
-          messages.add(
-            ChatMessage(
-              sender = MessageSender.GEMINI,
-              text = "⚠️ ন্যানো ব্যানানা দিয়ে ছবি তৈরি করতে সমস্যা হয়েছে: ${err.message}"
-            )
-          )
-        }
-      } else {
-        // Conversational AI Generation
-        val historyList = messages.map {
-          Pair(if (it.sender == MessageSender.USER) "user" else "model", it.text)
-        }
-        val textResult = geminiService.generateContent(cleanPrompt, selectedModel, historyList)
-        textResult.onSuccess { reply ->
-          messages.add(ChatMessage(sender = MessageSender.GEMINI, text = reply))
-          if (autoSpeak) {
-            onSpeak(reply)
-            isSpeakingAudio = true
-          }
-        }.onFailure { err ->
-          messages.add(
-            ChatMessage(
-              sender = MessageSender.GEMINI,
-              text = "⚠️ গুগল জেমিনি এআই রেসপন্স ত্রুটি: ${err.message}"
-            )
-          )
-        }
-      }
-
-      isThinking = false
-      listState.animateScrollToItem(maxOf(0, messages.size - 1))
-    }
+  fun submitPrompt(prompt: String) {
+    val clean = prompt.trim()
+    if (clean.isEmpty() || uiState.isThinking) return
+    inputValue = TextFieldValue("")
+    viewModel.sendPrompt(clean, activity, onSpeak)
   }
 
-  // Layout Colors
   val bgGradient = Brush.verticalGradient(
     colors = listOf(Color(0xFF060913), Color(0xFF0F172A), Color(0xFF080C16))
   )
@@ -284,26 +233,29 @@ fun GeminiAppScreen(
     modifier = Modifier
       .fillMaxSize()
       .testTag("gemini_main_screen"),
-    containerColor = Color.Transparent
+    containerColor = Color.Transparent,
+    contentWindowInsets = WindowInsets.safeDrawing
   ) { padding ->
     Column(
       modifier = Modifier
         .fillMaxSize()
         .background(bgGradient)
         .padding(padding)
+        // TV overscan-safe margins
+        .padding(horizontal = 24.dp, vertical = 10.dp)
     ) {
-      // 1. Top Bar
+      // 1. TV Top Bar (Horizontal D-pad Left/Right traversal)
       Row(
         modifier = Modifier
           .fillMaxWidth()
-          .padding(horizontal = 20.dp, vertical = 12.dp),
+          .padding(bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
       ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
           Box(
             modifier = Modifier
-              .size(44.dp)
+              .size(46.dp)
               .clip(CircleShape)
               .background(geminiSparkleBrush),
             contentAlignment = Alignment.Center
@@ -317,175 +269,215 @@ fun GeminiAppScreen(
           }
           Spacer(modifier = Modifier.width(12.dp))
           Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Text(
+                text = "Google Gemini TV",
+                fontSize = 21.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+              )
+              Spacer(modifier = Modifier.width(10.dp))
+              TvFocusableChip(
+                selected = true,
+                label = "v${GeminiService.APP_SEMVER}",
+                accentColor = Color(0xFF38BDF8),
+                onClick = { viewModel.openReleaseNotes(true) },
+                modifier = Modifier.testTag("release_notes_button")
+              )
+            }
             Text(
-              text = "Google Gemini",
-              fontSize = 20.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color.White
-            )
-            Text(
-              text = "Multimodal AI • Nano Banana Inside",
+              text = "Gemini 3.8 & 3.8 Pro • Android TV D-Pad Optimized",
               fontSize = 12.sp,
               color = Color(0xFF94A3B8)
             )
           }
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-          // Status indicator
-          Box(
-            modifier = Modifier
-              .clip(RoundedCornerShape(16.dp))
-              .background(Color(0xFF1E293B))
-              .padding(horizontal = 12.dp, vertical = 6.dp)
-          ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(8.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFF10B981))
-              )
-              Spacer(modifier = Modifier.width(6.dp))
-              Text(
-                text = "Gemini 2.0",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                color = Color(0xFFE2E8F0)
-              )
-            }
-          }
+        Row(
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          val isPro = uiState.selectedModel == GeminiService.MODEL_GEMINI_3_8_PRO
 
-          Spacer(modifier = Modifier.width(8.dp))
+          TvFocusableChip(
+            selected = !isPro,
+            label = "3.8",
+            accentColor = Color(0xFF38BDF8),
+            showStatusDot = true,
+            onClick = { viewModel.selectModel(GeminiService.MODEL_GEMINI_3_8) },
+            modifier = Modifier.testTag("model_chip_3_8")
+          )
 
-          IconButton(
-            onClick = { showSettingsDialog = true },
+          TvFocusableChip(
+            selected = isPro,
+            label = "3.8 Pro",
+            accentColor = Color(0xFFC084FC),
+            showStatusDot = true,
+            onClick = { viewModel.selectModel(GeminiService.MODEL_GEMINI_3_8_PRO) },
+            modifier = Modifier.testTag("model_chip_3_8_pro")
+          )
+
+          TvFocusableIconButton(
+            icon = Icons.Default.NewReleases,
+            contentDescription = "What's New in v3.0.0",
+            tint = Color(0xFF38BDF8),
+            onClick = { viewModel.openReleaseNotes(true) },
+            modifier = Modifier.testTag("changelog_icon_button")
+          )
+
+          TvFocusableIconButton(
+            icon = Icons.Default.Settings,
+            contentDescription = "Settings",
+            tint = Color(0xFFCBD5E1),
+            onClick = { viewModel.openSettings(true) },
             modifier = Modifier.testTag("settings_button")
-          ) {
-            Icon(
-              imageVector = Icons.Default.Settings,
-              contentDescription = "Settings",
-              tint = Color(0xFFCBD5E1)
-            )
-          }
+          )
         }
       }
 
-      // 2. Mode Selector (Chat, Nano Banana Image, Voice Talk)
+      // 2. Mode Selector Row (Chat, Nano Banana Image, Voice Talk, Clear)
       Row(
         modifier = Modifier
           .fillMaxWidth()
-          .padding(horizontal = 20.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+          .padding(bottom = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically
       ) {
-        FilterChip(
-          selected = currentMode == "chat",
-          onClick = { currentMode = "chat" },
-          label = { Text("💬 Chat") },
-          colors = FilterChipDefaults.filterChipColors(
-            selectedContainerColor = Color(0xFF38BDF8).copy(alpha = 0.25f),
-            selectedLabelColor = Color(0xFF38BDF8)
-          ),
+        TvFocusableChip(
+          selected = uiState.currentMode == "chat",
+          label = "💬 Chat",
+          accentColor = Color(0xFF38BDF8),
+          onClick = { viewModel.setMode("chat") },
           modifier = Modifier.testTag("mode_chat")
         )
 
-        FilterChip(
-          selected = currentMode == "image",
-          onClick = { currentMode = "image" },
-          label = { Text("🍌 ন্যানো ব্যানানা (Image)") },
-          colors = FilterChipDefaults.filterChipColors(
-            selectedContainerColor = Color(0xFFFBBF24).copy(alpha = 0.25f),
-            selectedLabelColor = Color(0xFFFBBF24)
-          ),
+        TvFocusableChip(
+          selected = uiState.currentMode == "image",
+          label = "🍌 ন্যানো ব্যানানা (Image)",
+          accentColor = Color(0xFFFBBF24),
+          onClick = { viewModel.setMode("image") },
           modifier = Modifier.testTag("mode_image")
         )
 
-        FilterChip(
-          selected = currentMode == "voice",
+        TvFocusableChip(
+          selected = uiState.currentMode == "voice",
+          label = "🎙️ Voice Talk",
+          accentColor = Color(0xFFA855F7),
           onClick = {
-            currentMode = "voice"
+            viewModel.setMode("voice")
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-              startSpeechListening(context, { isListeningMic = it }, { text -> inputText = text })
+              startSpeechListening(
+                context = context,
+                onListeningState = { viewModel.setListeningMic(it) },
+                onResult = { text -> inputValue = TextFieldValue(text, TextRange(text.length)) }
+              )
             } else {
               micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
           },
-          label = { Text("🎙️ Voice Talk") },
-          colors = FilterChipDefaults.filterChipColors(
-            selectedContainerColor = Color(0xFFA855F7).copy(alpha = 0.25f),
-            selectedLabelColor = Color(0xFFA855F7)
-          ),
           modifier = Modifier.testTag("mode_voice")
         )
+
+        if (uiState.messages.isNotEmpty()) {
+          Spacer(modifier = Modifier.weight(1f))
+          TvFocusableChip(
+            selected = false,
+            label = "Clear Chat",
+            accentColor = Color(0xFFEF4444),
+            onClick = { viewModel.clearMessages() },
+            modifier = Modifier.testTag("clear_chat_button")
+          )
+        }
       }
 
-      // 3. Message Feed
+      // 3. Main Content Area (TV Suggestion Grid or Scrollable Chat Feed)
       Box(
         modifier = Modifier
           .weight(1f)
           .fillMaxWidth()
-          .padding(horizontal = 16.dp)
       ) {
-        if (messages.isEmpty()) {
-          // Welcome Suggestions Card
-          Column(
-            modifier = Modifier
-              .fillMaxSize()
-              .padding(16.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-          ) {
-            Icon(
-              imageVector = Icons.Default.AutoAwesome,
-              contentDescription = null,
-              tint = Color(0xFF818CF8),
-              modifier = Modifier.size(56.dp)
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-              text = "Google Gemini এআই-তে স্বাগতম",
-              fontSize = 22.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color.White
-            )
-            Text(
-              text = "যেকোনো বিষয়ে প্রশ্ন করুন অথবা ন্যানো ব্যানানা দিয়ে ছবি তৈরি করুন",
-              fontSize = 14.sp,
-              color = Color(0xFF94A3B8),
-              textAlign = TextAlign.Center,
-              modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
-            )
+        if (uiState.messages.isEmpty()) {
+          val suggestions = listOf(
+            "🍌 ন্যানো ব্যানানা: নিয়ন সাইবারপাঙ্ক শহরের ছবি আঁকো",
+            "🌌 ব্ল্যাক হোল কীভাবে মহাবিশ্বে কাজ করে?",
+            "📶 ওয়াইফাই চালু করো",
+            "⏰ সকাল ৭টায় অ্যালার্ম দাও",
+            "💻 Kotlin Coroutine কীভাবে কাজ করে ব্যাখ্যা করো",
+            "🚀 Explain MVVM architecture in Android with Kotlin"
+          )
 
-            // Quick suggestion chips
-            val suggestions = listOf(
-              "🍌 ন্যানো ব্যানানা: নিয়ন সাইবারপাঙ্ক শহরের ছবি আঁকো",
-              "🌌 ব্ল্যাক হোল কীভাবে মহাবিশ্বে কাজ করে?",
-              "📶 ওয়াইফাই চালু করো",
-              "⏰ সকাল ৭টায় অ্যালার্ম দাও",
-              "💻 Kotlin Coroutine কীভাবে কাজ করে ব্যাখ্যা করো"
-            )
-
+          BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val isWideTv = maxWidth >= 640.dp
             Column(
-              verticalArrangement = Arrangement.spacedBy(8.dp),
-              modifier = Modifier.widthIn(max = 500.dp)
+              modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
+              verticalArrangement = Arrangement.Center,
+              horizontalAlignment = Alignment.CenterHorizontally
             ) {
-              suggestions.forEach { prompt ->
-                Surface(
-                  onClick = { handleSend(prompt) },
-                  shape = RoundedCornerShape(14.dp),
-                  color = Color(0xFF1E293B).copy(alpha = 0.7f),
-                  border = CardDefaults.outlinedCardBorder().copy(brush = Brush.horizontalGradient(listOf(Color(0xFF334155), Color(0xFF1E293B)))),
-                  modifier = Modifier.fillMaxWidth()
+              Icon(
+                imageVector = Icons.Default.AutoAwesome,
+                contentDescription = null,
+                tint = Color(0xFF818CF8),
+                modifier = Modifier.size(48.dp)
+              )
+              Spacer(modifier = Modifier.height(8.dp))
+              Text(
+                text = "Google Gemini 3.8 & 3.8 Pro-তে স্বাগতম",
+                fontSize = 23.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                textAlign = TextAlign.Center
+              )
+              Text(
+                text = "v${GeminiService.APP_SEMVER} • রিমোটের ডি-প্যাড দিয়ে কার্ড বেছে নিয়ে OK চাপুন অথবা নিচে লিখুন",
+                fontSize = 14.sp,
+                color = Color(0xFF94A3B8),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 4.dp, bottom = 18.dp)
+              )
+
+              if (isWideTv) {
+                // 2-Column TV Grid for effortless D-pad Up/Down/Left/Right selection
+                Column(
+                  verticalArrangement = Arrangement.spacedBy(10.dp),
+                  modifier = Modifier.widthIn(max = 920.dp)
                 ) {
-                  Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                  ) {
-                    Text(
+                  suggestions.chunked(2).forEachIndexed { rowIdx, pair ->
+                    Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                      pair.forEachIndexed { colIdx, prompt ->
+                        val cardModifier = Modifier
+                          .weight(1f)
+                          .let {
+                            if (rowIdx == 0 && colIdx == 0) it.focusRequester(initialFocusRequester) else it
+                          }
+                        TvSuggestionCard(
+                          text = prompt,
+                          onClick = { submitPrompt(prompt) },
+                          modifier = cardModifier
+                        )
+                      }
+                      if (pair.size == 1) {
+                        Spacer(modifier = Modifier.weight(1f))
+                      }
+                    }
+                  }
+                }
+              } else {
+                Column(
+                  verticalArrangement = Arrangement.spacedBy(10.dp),
+                  modifier = Modifier.widthIn(max = 540.dp)
+                ) {
+                  suggestions.forEachIndexed { index, prompt ->
+                    TvSuggestionCard(
                       text = prompt,
-                      color = Color(0xFFE2E8F0),
-                      fontSize = 14.sp,
-                      fontWeight = FontWeight.Medium
+                      onClick = { submitPrompt(prompt) },
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .let { if (index == 0) it.focusRequester(initialFocusRequester) else it }
                     )
                   }
                 }
@@ -496,42 +488,46 @@ fun GeminiAppScreen(
           LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            contentPadding = PaddingValues(vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
           ) {
-            items(messages, key = { it.id }) { message ->
-              MessageBubble(
+            items(uiState.messages, key = { it.id }) { message ->
+              TvMessageBubble(
                 message = message,
                 onSpeak = { text ->
                   onSpeak(text)
-                  isSpeakingAudio = true
+                  viewModel.setSpeakingAudio(true)
                 },
                 onStopSpeak = {
                   onStopSpeak()
-                  isSpeakingAudio = false
+                  viewModel.setSpeakingAudio(false)
                 }
               )
             }
 
-            if (isThinking) {
+            if (uiState.isThinking) {
               item {
                 Row(
                   verticalAlignment = Alignment.CenterVertically,
                   modifier = Modifier
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF1E293B).copy(alpha = 0.8f))
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                    .background(Color(0xFF1E293B).copy(alpha = 0.85f))
+                    .padding(horizontal = 18.dp, vertical = 12.dp)
                 ) {
                   CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
+                    modifier = Modifier.size(18.dp),
                     strokeWidth = 2.dp,
                     color = Color(0xFF38BDF8)
                   )
-                  Spacer(modifier = Modifier.width(10.dp))
+                  Spacer(modifier = Modifier.width(12.dp))
                   Text(
-                    text = if (currentMode == "image") "ন্যানো ব্যানানা ছবি তৈরি করছে..." else "Gemini চিন্তা করছে...",
+                    text = if (uiState.currentMode == "image") {
+                      "ন্যানো ব্যানানা ছবি তৈরি করছে..."
+                    } else {
+                      "${GeminiService.getModelDisplayName(uiState.selectedModel)} চিন্তা করছে..."
+                    },
                     color = Color(0xFF94A3B8),
-                    fontSize = 13.sp
+                    fontSize = 14.sp
                   )
                 }
               }
@@ -540,14 +536,20 @@ fun GeminiAppScreen(
         }
       }
 
-      // 4. Bottom Input Dock
+      // 4. TV Bottom Input Dock (with D-pad Up/Down/Left/Right escape & OK submit)
       Surface(
         modifier = Modifier
           .fillMaxWidth()
-          .padding(16.dp),
+          .padding(top = 8.dp),
         shape = RoundedCornerShape(24.dp),
-        color = Color(0xFF1E293B).copy(alpha = 0.95f),
-        border = CardDefaults.outlinedCardBorder().copy(brush = Brush.horizontalGradient(listOf(Color(0xFF38BDF8).copy(alpha = 0.4f), Color(0xFFC084FC).copy(alpha = 0.4f))))
+        color = Color(0xFF1E293B).copy(alpha = 0.96f),
+        border = androidx.compose.foundation.BorderStroke(
+          width = if (isInputFocused) 2.5.dp else 1.dp,
+          brush = Brush.horizontalGradient(
+            if (isInputFocused) listOf(Color(0xFF38BDF8), Color(0xFFC084FC))
+            else listOf(Color(0xFF38BDF8).copy(alpha = 0.35f), Color(0xFFC084FC).copy(alpha = 0.35f))
+          )
+        )
       ) {
         Row(
           modifier = Modifier
@@ -555,43 +557,82 @@ fun GeminiAppScreen(
             .padding(horizontal = 14.dp, vertical = 6.dp),
           verticalAlignment = Alignment.CenterVertically
         ) {
-          // Mic Dictation Button
-          IconButton(
+          TvFocusableIconButton(
+            icon = if (uiState.isListeningMic) Icons.Default.MicOff else Icons.Default.Mic,
+            contentDescription = "Voice Dictate",
+            tint = if (uiState.isListeningMic) Color(0xFFEF4444) else Color(0xFF38BDF8),
             onClick = {
-              if (isListeningMic) {
-                speechRecognizer?.stopListening()
-                isListeningMic = false
+              if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startSpeechListening(
+                  context = context,
+                  onListeningState = { viewModel.setListeningMic(it) },
+                  onResult = { text -> inputValue = TextFieldValue(text, TextRange(text.length)) }
+                )
               } else {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                  startSpeechListening(context, { isListeningMic = it }, { text -> inputText = text })
-                } else {
-                  micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                }
+                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
               }
             },
             modifier = Modifier.testTag("dictate_button")
-          ) {
-            Icon(
-              imageVector = if (isListeningMic) Icons.Default.MicOff else Icons.Default.Mic,
-              contentDescription = "Voice Dictate",
-              tint = if (isListeningMic) Color(0xFFEF4444) else Color(0xFF38BDF8)
-            )
-          }
+          )
 
-          // Input Text Field
+          Spacer(modifier = Modifier.width(8.dp))
+
           TextField(
-            value = inputText,
-            onValueChange = { inputText = it },
+            value = inputValue,
+            onValueChange = { inputValue = it },
             modifier = Modifier
               .weight(1f)
+              .focusRequester(inputFocusRequester)
+              .onFocusChanged { isInputFocused = it.isFocused }
+              .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown) {
+                  when (event.key) {
+                    Key.DirectionUp -> {
+                      focusManager.moveFocus(FocusDirection.Up)
+                      true
+                    }
+                    Key.DirectionDown -> {
+                      focusManager.moveFocus(FocusDirection.Down)
+                      true
+                    }
+                    Key.DirectionLeft -> {
+                      if (inputValue.text.isEmpty() || inputValue.selection.start == 0) {
+                        focusManager.moveFocus(FocusDirection.Left)
+                        true
+                      } else false
+                    }
+                    Key.DirectionRight -> {
+                      if (inputValue.text.isEmpty() || inputValue.selection.end == inputValue.text.length) {
+                        focusManager.moveFocus(FocusDirection.Right)
+                        true
+                      } else false
+                    }
+                    Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
+                      if (inputValue.text.isNotBlank()) {
+                        submitPrompt(inputValue.text)
+                      } else {
+                        keyboardController?.show()
+                      }
+                      true
+                    }
+                    else -> false
+                  }
+                } else false
+              }
               .testTag("ask_gemini_input"),
             placeholder = {
               Text(
-                text = if (currentMode == "image") "ন্যানো ব্যানানার জন্য ছবির বিবরণ দিন..." else "Ask Gemini anything...",
+                text = if (uiState.currentMode == "image") {
+                  "ন্যানো ব্যানানার জন্য ছবির বিবরণ দিন..."
+                } else {
+                  "Ask Gemini 3.8 / 3.8 Pro anything (Press OK to type)..."
+                },
                 color = Color(0xFF64748B),
                 fontSize = 15.sp
               )
             },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(onSend = { submitPrompt(inputValue.text) }),
             colors = TextFieldDefaults.colors(
               focusedContainerColor = Color.Transparent,
               unfocusedContainerColor = Color.Transparent,
@@ -604,209 +645,53 @@ fun GeminiAppScreen(
             singleLine = true
           )
 
-          // Send Button
-          IconButton(
-            onClick = { handleSend(inputText) },
-            enabled = inputText.trim().isNotEmpty() && !isThinking,
+          Spacer(modifier = Modifier.width(8.dp))
+
+          TvFocusableIconButton(
+            icon = Icons.AutoMirrored.Filled.Send,
+            contentDescription = "Send",
+            enabled = inputValue.text.trim().isNotEmpty() && !uiState.isThinking,
+            tint = Color(0xFF38BDF8),
+            onClick = { submitPrompt(inputValue.text) },
             modifier = Modifier.testTag("send_button")
-          ) {
-            Icon(
-              imageVector = Icons.AutoMirrored.Filled.Send,
-              contentDescription = "Send",
-              tint = if (inputText.trim().isNotEmpty() && !isThinking) Color(0xFF38BDF8) else Color(0xFF475569)
-            )
-          }
+          )
         }
       }
+
+      // 5. Subtle TV Remote Legend
+      Text(
+        text = "D-Pad: Up / Down / Left / Right  •  OK: Select  •  Back: Return / Exit",
+        fontSize = 11.sp,
+        color = Color(0xFF64748B),
+        textAlign = TextAlign.Center,
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(top = 6.dp)
+      )
     }
   }
 
-  // Settings Dialog
-  if (showSettingsDialog) {
-    var tempKey by remember { mutableStateOf(apiKey) }
-    var tempModel by remember { mutableStateOf(selectedModel) }
-    var tempAutoSpeak by remember { mutableStateOf(autoSpeak) }
-
-    AlertDialog(
-      onDismissRequest = { showSettingsDialog = false },
-      title = { Text("Gemini AI Settings", color = Color.White, fontWeight = FontWeight.Bold) },
-      text = {
-        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-          Text("Gemini API Key (Google AI Studio):", fontSize = 13.sp, color = Color(0xFF94A3B8))
-          OutlinedTextField(
-            value = tempKey,
-            onValueChange = { tempKey = it },
-            placeholder = { Text("Enter your Gemini API key (optional)", color = Color(0xFF64748B)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth().testTag("api_key_input")
-          )
-
-          Text("Model Selection:", fontSize = 13.sp, color = Color(0xFF94A3B8))
-          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro").forEach { mod ->
-              FilterChip(
-                selected = tempModel == mod,
-                onClick = { tempModel = mod },
-                label = { Text(mod.replace("gemini-", "")) }
-              )
-            }
-          }
-
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-              checked = tempAutoSpeak,
-              onCheckedChange = { tempAutoSpeak = it }
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Auto-read responses with Voice (TTS)", color = Color(0xFFE2E8F0), fontSize = 14.sp)
-          }
-        }
+  if (uiState.showSettingsDialog) {
+    TvSettingsDialog(
+      initialApiKey = uiState.apiKey,
+      initialModel = uiState.selectedModel,
+      initialAutoSpeak = uiState.autoSpeak,
+      onSave = { key, model, speak ->
+        viewModel.saveSettings(key, model, speak)
+        Toast.makeText(context, "Settings saved!", Toast.LENGTH_SHORT).show()
       },
-      confirmButton = {
-        Button(
-          onClick = {
-            apiKey = tempKey.trim()
-            selectedModel = tempModel
-            autoSpeak = tempAutoSpeak
-            sharedPrefs.edit()
-              .putString("api_key", apiKey)
-              .putString("model_name", selectedModel)
-              .putBoolean("auto_speak", autoSpeak)
-              .apply()
-            showSettingsDialog = false
-            Toast.makeText(context, "Settings saved!", Toast.LENGTH_SHORT).show()
-          }
-        ) {
-          Text("Save")
-        }
+      onOpenReleaseNotes = {
+        viewModel.openSettings(false)
+        viewModel.openReleaseNotes(true)
       },
-      dismissButton = {
-        TextButton(onClick = { showSettingsDialog = false }) {
-          Text("Cancel")
-        }
-      },
-      containerColor = Color(0xFF1E293B),
-      textContentColor = Color(0xFFE2E8F0)
+      onDismiss = { viewModel.openSettings(false) }
     )
   }
-}
 
-@Composable
-fun MessageBubble(
-  message: ChatMessage,
-  onSpeak: (String) -> Unit,
-  onStopSpeak: () -> Unit
-) {
-  val context = LocalContext.current
-  val isUser = message.sender == MessageSender.USER
-  var isPlaying by remember { mutableStateOf(false) }
-
-  Row(
-    modifier = Modifier.fillMaxWidth(),
-    horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
-  ) {
-    if (!isUser) {
-      Box(
-        modifier = Modifier
-          .size(36.dp)
-          .clip(CircleShape)
-          .background(Brush.linearGradient(listOf(Color(0xFF38BDF8), Color(0xFFC084FC)))),
-        contentAlignment = Alignment.Center
-      ) {
-        Icon(
-          imageVector = Icons.Default.AutoAwesome,
-          contentDescription = "Gemini",
-          tint = Color.White,
-          modifier = Modifier.size(20.dp)
-        )
-      }
-      Spacer(modifier = Modifier.width(10.dp))
-    }
-
-    Column(
-      modifier = Modifier
-        .widthIn(max = 520.dp)
-        .clip(RoundedCornerShape(18.dp))
-        .background(
-          if (isUser) Brush.linearGradient(listOf(Color(0xFF2563EB), Color(0xFF38BDF8)))
-          else Brush.linearGradient(listOf(Color(0xFF1E293B), Color(0xFF182234)))
-        )
-        .border(
-          width = 1.dp,
-          color = if (isUser) Color(0xFF60A5FA).copy(alpha = 0.5f) else Color(0xFF334155),
-          shape = RoundedCornerShape(18.dp)
-        )
-        .padding(14.dp)
-    ) {
-      Text(
-        text = message.text,
-        color = Color.White,
-        fontSize = 15.sp,
-        lineHeight = 22.sp
-      )
-
-      if (message.isImage && message.imageUrl != null) {
-        Spacer(modifier = Modifier.height(10.dp))
-        AsyncImage(
-          model = ImageRequest.Builder(context)
-            .data(message.imageUrl)
-            .crossfade(true)
-            .build(),
-          contentDescription = "Nano Banana Generated Image",
-          contentScale = ContentScale.Crop,
-          modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp)
-            .clip(RoundedCornerShape(12.dp))
-        )
-      }
-
-      if (!isUser) {
-        Spacer(modifier = Modifier.height(8.dp))
-        Row(
-          horizontalArrangement = Arrangement.spacedBy(8.dp),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          // Copy button
-          IconButton(
-            onClick = {
-              val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-              clipboard.setPrimaryClip(ClipData.newPlainText("Gemini Response", message.text))
-              Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
-            },
-            modifier = Modifier.size(32.dp)
-          ) {
-            Icon(
-              imageVector = Icons.Default.ContentCopy,
-              contentDescription = "Copy",
-              tint = Color(0xFF94A3B8),
-              modifier = Modifier.size(16.dp)
-            )
-          }
-
-          // TTS Speak button
-          IconButton(
-            onClick = {
-              if (isPlaying) {
-                onStopSpeak()
-                isPlaying = false
-              } else {
-                onSpeak(message.text)
-                isPlaying = true
-              }
-            },
-            modifier = Modifier.size(32.dp)
-          ) {
-            Icon(
-              imageVector = if (isPlaying) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
-              contentDescription = "Speak",
-              tint = if (isPlaying) Color(0xFF38BDF8) else Color(0xFF94A3B8),
-              modifier = Modifier.size(18.dp)
-            )
-          }
-        }
-      }
-    }
+  if (uiState.showReleaseNotesDialog) {
+    TvReleaseNotesDialog(
+      onDismiss = { viewModel.openReleaseNotes(false) }
+    )
   }
 }
 
@@ -823,7 +708,7 @@ private fun startSpeechListening(
   val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
     putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-    putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to Gemini...")
+    putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to Gemini TV...")
   }
 
   try {
@@ -846,7 +731,7 @@ private fun startSpeechListening(
       override fun onEvent(eventType: Int, params: Bundle?) {}
     })
     recognizer.startListening(intent)
-  } catch (e: Exception) {
+  } catch (_: Exception) {
     onListeningState(false)
   }
 }

@@ -55,4 +55,26 @@ class ExampleUnitTest {
       }
     }
   }
+
+  @Test
+  fun testGemini38And38ProIntegrationAndSemVer() = runBlocking {
+    org.junit.Assert.assertEquals("3.0.0", GeminiService.APP_SEMVER)
+    org.junit.Assert.assertEquals("gemini-3.8-flash", GeminiService.normalizeModelId("gemini-3.8"))
+    org.junit.Assert.assertEquals("gemini-3.8-flash", GeminiService.normalizeModelId("gemini-3.8-flash"))
+    org.junit.Assert.assertEquals("gemini-3.8-pro", GeminiService.normalizeModelId("gemini-3.8-pro"))
+
+    // Legacy model migration
+    org.junit.Assert.assertEquals("gemini-3.8-flash", GeminiService.normalizeModelId("gemini-2.0-flash"))
+    org.junit.Assert.assertEquals("gemini-3.8-pro", GeminiService.normalizeModelId("gemini-1.5-pro"))
+
+    val service = GeminiService { "" }
+    val proResult = service.generateContent(
+      prompt = "Who are you?",
+      model = GeminiService.MODEL_GEMINI_3_8_PRO
+    )
+    assertTrue(proResult.isSuccess)
+    val reply = proResult.getOrNull().orEmpty()
+    assertTrue("Should identify Gemini 3.8 Pro", reply.contains("Gemini 3.8 Pro"))
+    assertTrue("Should reflect 3.0.0 version", reply.contains("3.0.0"))
+  }
 }
